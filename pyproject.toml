@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "text2cypher-composer"
+version = "0.1.0"
+description = "Translate natural-language questions into executable Cypher queries against a Neo4j database, with pluggable vanilla/schema/RAG prompting strategies."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "langchain-core>=0.2",
+    "langchain-community>=0.2",
+    "langchain-openai>=0.1",
+    "neo4j>=5.27,<6",
+    "chromadb>=0.5",
+    "CyVer>=2.0.0,<3",
+    "pandas>=2.0",
+    "textdistance>=4.6",
+]
+
+[project.optional-dependencies]
+finetune = [
+    "torch",
+    "transformers>=4.40",
+    "accelerate",
+    "peft>=0.11",
+    "bitsandbytes",
+    "datasets>=2.19",
+    "langchain-huggingface>=0.0.3",
+]
+dataset-tools = ["tiktoken>=0.5"]
+local-embeddings = [
+    "sentence-transformers>=2.2",
+    "langchain-huggingface>=0.0.3",
+]
+
+[tool.setuptools.packages.find]
+include = ["text2cypher_composer*"]
