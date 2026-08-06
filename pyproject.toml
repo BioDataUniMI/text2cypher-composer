@@ -4,11 +4,28 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "text2cypher-composer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Translate natural-language questions into executable Cypher queries against a Neo4j database, with pluggable vanilla/schema/RAG prompting strategies."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
+authors = [
+    { name = "Emanuele Cavalleri", email = "emanuele.cavalleri@unimi.it" },
+]
+keywords = ["neo4j", "cypher", "text2cypher", "llm", "rag", "langchain", "graph-database"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "langchain-core>=0.2",
     "langchain-community>=0.2",
@@ -35,6 +52,15 @@ local-embeddings = [
     "sentence-transformers>=2.2",
     "langchain-huggingface>=0.0.3",
 ]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/BioDataUniMI/text2cypher-composer"
+Repository = "https://github.com/BioDataUniMI/text2cypher-composer"
+Issues = "https://github.com/BioDataUniMI/text2cypher-composer/issues"
 
 [tool.setuptools.packages.find]
 include = ["text2cypher_composer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

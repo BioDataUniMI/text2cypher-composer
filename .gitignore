@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test/coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local scratch data produced by following the README/demo notebook
+chroma_db/
+mock_rag_dataset/
+my_dataset/

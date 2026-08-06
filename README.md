@@ -8,8 +8,11 @@ against a Neo4j database, using the prompting strategies from the
 ## Install
 
 ```bash
-pip install -e .
+pip install text2cypher-composer
 ```
+
+Cloned this repo instead and want an editable install that picks up local changes?
+`pip install -e .` from the repo root does that (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 Set `OPENAI_API_KEY` in the environment if using an OpenAI model id or the
 `RAGDataset` embedder (both default to OpenAI embeddings/chat models).
@@ -17,14 +20,14 @@ Set `OPENAI_API_KEY` in the environment if using an OpenAI model id or the
 LoRA-finetuning a local model (`finetune_lora`/`load_finetuned_model`) needs an extra:
 
 ```bash
-pip install -e ".[finetune]"
+pip install "text2cypher-composer[finetune]"
 ```
 
 Embedding a RAG dataset with a local HuggingFace/sentence-transformers model instead of OpenAI
 (`RAGDataset.index_from_root(..., embedding_model="sentence-transformers/...")`) needs another:
 
 ```bash
-pip install -e ".[local-embeddings]"
+pip install "text2cypher-composer[local-embeddings]"
 ```
 
 ## Usage
@@ -464,3 +467,11 @@ and Coverage compare two queries' *result rows* rather than their Cypher
 text: since Neo4j doesn't guarantee row order without `ORDER BY`, rows are
 greedily bipartite-matched by similarity before being compared whenever the
 gold query has none.
+
+## Contributing
+
+This library **composes** a fixed set of techniques behind `run()` — adding a new one (a new
+prompt template, plugged into the same schema/RAG/validation/rescue machinery every existing
+technique shares) is the most natural contribution. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the step-by-step guide, including how to propose it and
+open a pull request if you don't already have push access to this repository.

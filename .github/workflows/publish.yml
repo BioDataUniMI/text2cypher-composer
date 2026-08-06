@@ -1,0 +1,56 @@
+name: Publish to PyPI
+
+# Push a tag like "v0.1.1" (matching pyproject.toml's [project] version) to
+# build and publish that release to PyPI. No stored token: authentication is
+# via PyPI's Trusted Publishing (OIDC) — see CONTRIBUTING.md for the
+# one-time setup this requires on pypi.org.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check tag matches pyproject.toml version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME (version $TAG_VERSION) does not match pyproject.toml's version $PKG_VERSION."
+            exit 1
+          fi
+
+      - name: Install build tooling
+        run: pip install build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/text2cypher-composer
+    permissions:
+      id-token: write # required for Trusted Publishing — do not add a token secret instead
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
