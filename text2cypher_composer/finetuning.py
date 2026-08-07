@@ -8,6 +8,15 @@ pass directly as `run()`'s `model` argument, the same "bring your own
 Runnable" path `resolve_model` already supports for any non-OpenAI chat
 model.
 
+`config.base_model`/`base_model` is not restricted to `DEFAULT_BASE_MODEL` —
+any Hugging Face causal-LM repo id works, since it's passed as-is to
+`AutoModelForCausalLM.from_pretrained`/`AutoTokenizer.from_pretrained`. In
+particular, `DEFAULT_TARGET_MODULES` (the LoRA adapter's attention/MLP
+projection names) applies unchanged to any Llama-style architecture — which
+covers Llama, Mistral, and Qwen2 checkpoints alike, e.g.
+`"mistralai/Mistral-7B-Instruct-v0.3"` or `"Qwen/Qwen2.5-7B-Instruct"` — not
+just Llama itself.
+
 `finetune_lora`/`load_finetuned_model` need the optional fine-tuning
 dependencies (`torch`, `transformers`, `peft`, `datasets`,
 `langchain_huggingface`) — install with
@@ -19,7 +28,9 @@ them.
 repo: you must accept its license on the model page and authenticate
 locally (`huggingface-cli login`, or an `HF_TOKEN` env var) before calling
 `finetune_lora`/`load_finetuned_model` with it — otherwise `from_pretrained`
-raises a 401/403.
+raises a 401/403. This gating is specific to that particular repo, not to
+fine-tuning in general — most Mistral/Qwen checkpoints are not gated, though
+that varies by repo, so check the model page for whichever one you pick.
 """
 from __future__ import annotations
 

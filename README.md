@@ -1,5 +1,21 @@
 # text2cypher-composer
 
+[![PyPI](https://img.shields.io/pypi/v/text2cypher-composer?label=PyPI&logo=pypi)](https://pypi.org/project/text2cypher-composer/)
+[![Pypi total project downloads](https://static.pepy.tech/badge/text2cypher-composer)](https://pepy.tech/project/text2cypher-composer)
+
+[![GitHub Action: Publish to PyPI](https://github.com/BioDataUniMI/text2cypher-composer/actions/workflows/publish.yml/badge.svg)](https://github.com/BioDataUniMI/text2cypher-composer/actions/workflows/publish.yml)
+
+<!-- Quality/coverage badges below are placeholders — this project isn't registered on
+     SonarCloud/Codacy/Code Climate yet. Replace the project key / badge ID in each URL
+     (and set up the corresponding integration) before relying on them; until then they'll
+     show as broken/"unknown". Coveralls' URL is already valid as-is (no token needed), it
+     just needs Coveralls enabled for this repo. -->
+[![SonarCloud Quality](https://sonarcloud.io/api/project_badges/measure?project=BioDataUniMI_text2cypher-composer&metric=alert_status)](https://sonarcloud.io/dashboard?id=BioDataUniMI_text2cypher-composer)
+[![Codacy Maintainability](https://app.codacy.com/project/badge/Grade/REPLACE_WITH_CODACY_BADGE_ID)](https://www.codacy.com/gh/BioDataUniMI/text2cypher-composer/dashboard)
+[![Maintainability](https://api.codeclimate.com/v1/badges/REPLACE_WITH_CODECLIMATE_ID/maintainability)](https://codeclimate.com/github/BioDataUniMI/text2cypher-composer/maintainability)
+[![Code Climate Coverage](https://api.codeclimate.com/v1/badges/REPLACE_WITH_CODECLIMATE_ID/test_coverage)](https://codeclimate.com/github/BioDataUniMI/text2cypher-composer/test_coverage)
+[![Coveralls Coverage](https://coveralls.io/repos/github/BioDataUniMI/text2cypher-composer/badge.svg?branch=main)](https://coveralls.io/github/BioDataUniMI/text2cypher-composer?branch=main)
+
 Translate a natural-language question into an executable Cypher query and run it
 against a Neo4j database, using the prompting strategies from the
 [bio2C](bio2C/README.md) benchmark: `vanilla`, `Schema`, `RAG`, `RAG+O`,
@@ -16,6 +32,24 @@ Cloned this repo instead and want an editable install that picks up local change
 
 Set `OPENAI_API_KEY` in the environment if using an OpenAI model id or the
 `RAGDataset` embedder (both default to OpenAI embeddings/chat models).
+
+Using an Anthropic model id (e.g. `"claude-sonnet-5"`) needs `ANTHROPIC_API_KEY` set, plus an extra:
+
+```bash
+pip install "text2cypher-composer[anthropic]"
+```
+
+Using a Google Gemini model id (e.g. `"gemini-2.5-flash"`) needs `GOOGLE_API_KEY` set, plus an extra:
+
+```bash
+pip install "text2cypher-composer[google]"
+```
+
+Using a DeepSeek model id (e.g. `"deepseek-chat"`) needs `DEEPSEEK_API_KEY` set, plus an extra:
+
+```bash
+pip install "text2cypher-composer[deepseek]"
+```
 
 LoRA-finetuning a local model (`finetune_lora`/`load_finetuned_model`) needs an extra:
 
@@ -126,10 +160,28 @@ variables).
 
 ### `model`
 
-Either an OpenAI chat model id (`"gpt-4o"`, `"gpt-4o-mini"`, a fine-tuned
-`"ft:..."` id), or any LangChain-compatible chat model / `Runnable` — e.g. a
-`HuggingFacePipeline` wrapping a local LLaMA checkpoint (base or fine-tuned
-via PEFT), pre-configured with its own generation parameters.
+**The chat backend is pluggable via `model`.** It accepts these kinds of values:
+
+- an **OpenAI** chat model id, e.g. `"gpt-4o"`, `"gpt-4o-mini"`, or a fine-tuned `"ft:..."` id
+  — needs `OPENAI_API_KEY`;
+- an **Anthropic** chat model id, e.g. `"claude-sonnet-5"`, `"claude-opus-4-1"` — a `"claude"`
+  prefix is what selects this backend. Needs `ANTHROPIC_API_KEY` and the optional `anthropic`
+  extra: `pip install "text2cypher-composer[anthropic]"`;
+- a **Google Gemini** chat model id, e.g. `"gemini-2.5-pro"`, `"gemini-2.5-flash"` — a `"gemini"`
+  prefix selects this backend. Needs `GOOGLE_API_KEY` and the optional `google` extra:
+  `pip install "text2cypher-composer[google]"`;
+- a **DeepSeek** chat model id, e.g. `"deepseek-chat"`, `"deepseek-reasoner"` — a `"deepseek"`
+  prefix selects this backend. Needs `DEEPSEEK_API_KEY` and the optional `deepseek` extra:
+  `pip install "text2cypher-composer[deepseek]"`;
+- or any other LangChain-compatible chat model / `Runnable` — e.g. a `HuggingFacePipeline`
+  wrapping a local checkpoint (Llama, Mistral, Qwen, ..., base or fine-tuned via PEFT — see
+  "Fine-tuning your own model" below), or a chat model from any other provider you've already
+  built yourself — pre-configured with its own generation parameters, the same "bring your own
+  object" pattern `embedding_model`/`nlp` use elsewhere in this library.
+
+None of these prefixes overlap (`"gpt-"`/`"o1"`/`"ft:..."` vs. `"claude-"` vs. `"gemini-"` vs.
+`"deepseek-"`), so a plain model id string is always resolved unambiguously — see
+`llm_backend_for` if you want the exact rule.
 
 ### `rescue_prompt` / `max_retries`
 
@@ -392,6 +444,26 @@ result = run(
 LoRA rank 16 on the attention/MLP projections, 3 epochs) — override any field to change them.
 `load_finetuned_model` (or a `HuggingFacePipeline` you build yourself, fine-tuned or not) works
 the same "bring your own `Runnable`" way `model` already supports for any non-OpenAI chat model.
+
+**`base_model` isn't limited to Llama.** `DEFAULT_TARGET_MODULES` (the LoRA adapter's
+attention/MLP projection names) applies unchanged to any Llama-style architecture, which also
+covers Mistral and Qwen2 checkpoints — just override `base_model` (and `output_dir`, so adapters
+don't collide):
+
+```python
+result = finetune_lora(
+    train_df,
+    config=LoRATrainingConfig(
+        base_model="Qwen/Qwen2.5-7B-Instruct",  # or "mistralai/Mistral-7B-Instruct-v0.3"
+        output_dir="./qwen2.5_lora_mirnakgt2c",
+    ),
+)
+
+qwen_ft = load_finetuned_model("Qwen/Qwen2.5-7B-Instruct", result.adapter_path)
+```
+
+Unlike `meta-llama/Llama-3.1-8B`, most Mistral/Qwen repos aren't gated — but that varies by
+repo, so check the model page for whichever one you pick.
 
 ### Introspection
 
