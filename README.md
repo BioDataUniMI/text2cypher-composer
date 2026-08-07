@@ -543,6 +543,32 @@ text: since Neo4j doesn't guarantee row order without `ORDER BY`, rows are
 greedily bipartite-matched by similarity before being compared whenever the
 gold query has none.
 
+Besides the metric/pass@j columns, `report.to_dataframe()` also carries, per question: any
+columns `gold_df` had beyond `question`/`query` (e.g. bio2C's `"ID"`/`"level"`, if you built
+`gold_df` with `load_finetune_levels`), `prompt` (the exact messages sent for the first
+attempt), `gold_data`/`predicted_data` (the gold/generated query's result rows), and
+`retrieved_example_ids`/`retrieved_example_distances` for RAG techniques (`None` otherwise).
+
+**`save_evaluation_report` persists a report as a `.pkl`/`.xlsx` pair**, one per (model,
+technique) — named `evaluating_text2cypher_{model}_{technique}.{pkl,xlsx}`:
+
+```python
+from text2cypher_composer import save_evaluation_report
+
+paths = save_evaluation_report(report, "evaluating_cypher_jaccard RTT/gpt-4o-mini")
+# {"pkl": PosixPath(".../evaluating_text2cypher_gpt-4o_Schema.pkl"),
+#  "xlsx": PosixPath(".../evaluating_text2cypher_gpt-4o_Schema.xlsx")}
+```
+
+The `.pkl` holds `report.to_dataframe()` as-is — `prompt`/`gold_data`/`predicted_data`/
+`retrieved_example_*` stay native Python lists/dicts, no extra dependency needed. The `.xlsx` is
+the same table with those columns stringified (Excel has no list/dict type) and needs the
+optional `excel` dependency:
+
+```bash
+pip install "text2cypher-composer[excel]"
+```
+
 ## Contributing
 
 This library **composes** a fixed set of techniques behind `run()` — adding a new one (a new

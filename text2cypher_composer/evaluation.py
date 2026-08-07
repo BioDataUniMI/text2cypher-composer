@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 
@@ -24,7 +26,9 @@ class QuestionEvaluation:
     `jaro_winkler`/`levenshtein`/`jaccard`/`coverage` are computed on the
     first attempt only. `passes[i]` is whether attempt `i` alone achieved
     `coverage == 1.0`; `pass_at(j)` folds `passes[:j]` into "at least one of
-    the first j attempts passed".
+    the first j attempts passed". `extra` is any `df` columns other than
+    "question"/"query" (e.g. bio2C's "ID"/"level"), carried through unchanged
+    for traceability in `to_dataframe()`.
     """
 
     question: str
@@ -36,6 +40,7 @@ class QuestionEvaluation:
     jaccard: float
     coverage: float
     passes: List[bool]
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     def pass_at(self, j: int) -> bool:
         return any(self.passes[:j])
@@ -62,15 +67,27 @@ class EvaluationReport:
     details: List[QuestionEvaluation]
 
     def to_dataframe(self) -> pd.DataFrame:
-        """Flatten `details` into one row per question, with a pass@j column for every j in 1..k."""
+        """Flatten `details` into one row per question, with a pass@j column for every j in 1..k.
+
+        Beyond the core metrics, each row also carries: any `extra` columns
+        from the input `df` (e.g. bio2C's "ID"/"level"); `prompt`, the exact
+        messages sent for the first attempt; `gold_data`/`predicted_data`,
+        the gold/generated query's result rows; and
+        `retrieved_example_ids`/`retrieved_example_distances` for RAG
+        techniques (`None` otherwise) — see `Text2CypherResult.retrieved_examples`.
+        """
         k = self.summary.k
         rows = []
         for d in self.details:
+            first = d.attempts[0]
+            predicted_data = first.result if first.executed else []
+            retrieved = first.retrieved_examples or {}
             row = {
                 "question": d.question,
+                **d.extra,
                 "gold_cypher": d.gold_cypher,
-                "generated_cypher": d.attempts[0].cypher,
-                "executed": d.attempts[0].executed,
+                "generated_cypher": first.cypher,
+                "executed": first.executed,
                 "jaro_winkler": d.jaro_winkler,
                 "levenshtein": d.levenshtein,
                 "jaccard": d.jaccard,
@@ -78,6 +95,11 @@ class EvaluationReport:
             }
             for j in range(1, k + 1):
                 row[f"pass@{j}"] = d.pass_at(j)
+            row["prompt"] = first.prompt
+            row["gold_data"] = d.gold_data
+            row["predicted_data"] = predicted_data
+            row["retrieved_example_ids"] = retrieved.get("example_ids")
+            row["retrieved_example_distances"] = retrieved.get("example_distances")
             rows.append(row)
         return pd.DataFrame(rows)
 
@@ -126,6 +148,7 @@ def evaluate_technique(
         raise ValueError("`k` must be >= 1.")
 
     graph = resolve_database(database)
+    extra_cols = [c for c in df.columns if c not in ("question", "query")]
 
     details: List[QuestionEvaluation] = []
     for _, row in df.iterrows():
@@ -159,6 +182,7 @@ def evaluate_technique(
                 jaccard=jaccard_similarity(gold_cypher, gold_data, first.cypher, first_pred_data),
                 coverage=attempt_coverages[0],
                 passes=[c >= 1.0 for c in attempt_coverages],
+                extra={c: row[c] for c in extra_cols},
             )
         )
 
@@ -180,3 +204,54 @@ def evaluate_technique(
     )
 
     return EvaluationReport(summary=summary, details=details)
+
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[\\/:]")
+
+
+def save_evaluation_report(report: EvaluationReport, output_dir: Union[str, Path]) -> Dict[str, Path]:
+    """Persist `report` to disk as a `.pkl` and an `.xlsx`, one pair per (model, technique).
+
+    Named `evaluating_text2cypher_{model}_{technique}.{pkl,xlsx}` under
+    `output_dir` (created if missing), taking `model`/`technique` from
+    `report.summary` — mirroring the naming convention of the bio2C
+    evaluation notebooks `evaluate_technique` was ported from. Characters
+    unsafe in a filename (`/`, `\\`, `:` — e.g. a HuggingFace model id or a
+    `"ft:..."` id) are replaced with `_`.
+
+    The `.pkl` holds `report.to_dataframe()` as-is (lists/dicts intact —
+    `prompt`, `gold_data`, `predicted_data`, `retrieved_example_*`, no extra
+    dependency needed). The `.xlsx` is the same table with any list/dict
+    column stringified (Excel has no native list/dict type), and needs the
+    optional `excel` dependency (`openpyxl`) — install with
+    `pip install "text2cypher-composer[excel]"`.
+
+    Returns `{"pkl": <path>, "xlsx": <path>}`.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model = _UNSAFE_FILENAME_CHARS.sub("_", report.summary.model)
+    technique = _UNSAFE_FILENAME_CHARS.sub("_", report.summary.technique)
+    stem = f"evaluating_text2cypher_{model}_{technique}"
+    pkl_path = output_dir / f"{stem}.pkl"
+    xlsx_path = output_dir / f"{stem}.xlsx"
+
+    df = report.to_dataframe()
+    df.to_pickle(pkl_path)
+
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "save_evaluation_report requires the optional excel dependency (openpyxl) to "
+            'write the .xlsx file. Install it with `pip install "text2cypher-composer[excel]"`.'
+        ) from e
+
+    excel_df = df.copy()
+    for col in excel_df.columns:
+        if excel_df[col].map(lambda v: isinstance(v, (list, dict))).any():
+            excel_df[col] = excel_df[col].map(str)
+    excel_df.to_excel(xlsx_path, index=False)
+
+    return {"pkl": pkl_path, "xlsx": xlsx_path}

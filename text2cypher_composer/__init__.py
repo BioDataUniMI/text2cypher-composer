@@ -1,7 +1,13 @@
 from .core import Text2CypherResult, run
 from .dataset_builder import RAGExampleFiles, build_rag_example_files
 from .embeddings import EmbeddingMeta, embedding_backend_for, resolve_embedder
-from .evaluation import EvaluationReport, EvaluationSummary, QuestionEvaluation, evaluate_technique
+from .evaluation import (
+    EvaluationReport,
+    EvaluationSummary,
+    QuestionEvaluation,
+    evaluate_technique,
+    save_evaluation_report,
+)
 from .finetune_dataset import (
     GPTFinetuneJSONL,
     build_gpt_finetune_jsonl,
@@ -63,6 +69,7 @@ __all__ = [
     "EvaluationReport",
     "EvaluationSummary",
     "QuestionEvaluation",
+    "save_evaluation_report",
     "jaro_winkler_similarity",
     "normalized_levenshtein_similarity",
     "jaccard_similarity",
