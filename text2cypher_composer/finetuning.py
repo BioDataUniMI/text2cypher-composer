@@ -14,6 +14,12 @@ dependencies (`torch`, `transformers`, `peft`, `datasets`,
 `pip install "text2cypher-composer[finetune]"`. They're imported lazily
 (only inside these two functions), so the rest of the library works without
 them.
+
+`DEFAULT_BASE_MODEL` (`meta-llama/Llama-3.1-8B`) is a gated Hugging Face
+repo: you must accept its license on the model page and authenticate
+locally (`huggingface-cli login`, or an `HF_TOKEN` env var) before calling
+`finetune_lora`/`load_finetuned_model` with it — otherwise `from_pretrained`
+raises a 401/403.
 """
 from __future__ import annotations
 
@@ -98,6 +104,7 @@ def finetune_lora(
         from transformers import (
             AutoModelForCausalLM,
             AutoTokenizer,
+            BitsAndBytesConfig,
             Trainer,
             TrainingArguments,
             default_data_collator,
@@ -115,10 +122,11 @@ def finetune_lora(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    quantization_config = BitsAndBytesConfig(load_in_4bit=True) if config.load_in_4bit else None
     model = AutoModelForCausalLM.from_pretrained(
         config.base_model,
         device_map="auto",
-        load_in_4bit=config.load_in_4bit,
+        quantization_config=quantization_config,
         torch_dtype=torch.bfloat16,
         token=True,
     )
@@ -149,7 +157,6 @@ def finetune_lora(
 
     training_args = TrainingArguments(
         output_dir=f"{config.output_dir}-checkpoints",
-        overwrite_output_dir=True,
         num_train_epochs=config.num_train_epochs,
         per_device_train_batch_size=config.per_device_train_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -169,7 +176,7 @@ def finetune_lora(
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=default_data_collator,
     )
     train_output = trainer.train()
@@ -206,7 +213,7 @@ def load_finetuned_model(
         import torch
         from langchain_huggingface import HuggingFacePipeline
         from peft import PeftModel
-        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
     except ImportError as e:
         raise ImportError(
             "load_finetuned_model requires the optional fine-tuning dependencies "
@@ -214,8 +221,9 @@ def load_finetuned_model(
             '`pip install "text2cypher-composer[finetune]"`.'
         ) from e
 
+    quantization_config = BitsAndBytesConfig(load_in_4bit=True) if load_in_4bit else None
     base = AutoModelForCausalLM.from_pretrained(
-        base_model, device_map="auto", load_in_4bit=load_in_4bit, torch_dtype=torch.bfloat16
+        base_model, device_map="auto", quantization_config=quantization_config, torch_dtype=torch.bfloat16
     )
     tokenizer = AutoTokenizer.from_pretrained(adapter_path)
     model = PeftModel.from_pretrained(base, adapter_path)

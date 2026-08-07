@@ -364,7 +364,10 @@ any other OpenAI model id.
 
 **3. Or LoRA-finetune a local model yourself**, e.g. LLaMA — `finetune_lora` needs the optional
 `finetune` extra (`pip install "text2cypher-composer[finetune]"`: torch, transformers, peft,
-datasets) and, realistically, a GPU:
+datasets) and, realistically, a GPU. The default base model, `meta-llama/Llama-3.1-8B`, is
+**gated** on Hugging Face: accept its license on the model page and run `huggingface-cli login`
+(or set `HF_TOKEN`) before calling `finetune_lora`/`load_finetuned_model`, otherwise you'll hit a
+401/403:
 
 ```python
 from text2cypher_composer import LoRATrainingConfig, finetune_lora, load_finetuned_model

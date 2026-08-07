@@ -744,6 +744,10 @@ defaults to `meta-llama/Llama-3.1-8B`, matching the notebook) on `train_df`'s qu
 pairs, saving the adapter to `config.output_dir`. Needs the optional `finetune` extra
 (`pip install "text2cypher-composer[finetune]"` — torch, transformers, peft, datasets) and,
 realistically, a GPU — demonstration-only cell, not executed here.
+
+`meta-llama/Llama-3.1-8B` is **gated** on Hugging Face: accept its license on the model page and
+run `huggingface-cli login` (or set `HF_TOKEN`) before calling `finetune_lora` with it, otherwise
+`from_pretrained` raises a 401/403.
 """)
 
 code("""\
@@ -764,7 +768,8 @@ pre-configured with its own generation parameters — pass it straight through a
 match the notebook's inference-time prompt. A non-finetuned local pipeline (e.g. straight from
 `bio2C/evaluating_text2cypher/evaluating_text2cypher_llama.ipynb`) works the same way — just
 build the `HuggingFacePipeline` yourself instead of via `load_finetuned_model`. Also
-demonstration-only (needs a GPU and the model weights available).
+demonstration-only (needs a GPU, the same Hugging Face login from §9.4, and the model weights
+available).
 """)
 
 code("""\

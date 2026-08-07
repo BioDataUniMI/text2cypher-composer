@@ -179,6 +179,30 @@ for a "pending" publisher) → *Publishing* → add a new GitHub publisher with:
 4. Watch the *Actions* tab — `build` runs first (and fails fast if the tag doesn't match
    `pyproject.toml`'s version), then `publish` uploads to PyPI.
 
-To test a release without touching real PyPI, use the manual local flow instead
-(`python -m build && twine upload --repository testpypi dist/*`) — the automated workflow
-only publishes to real PyPI.
+### Testing a release on TestPyPI first
+
+[`.github/workflows/publish-testpypi.yml`](.github/workflows/publish-testpypi.yml) does the same
+build, but publishes to **TestPyPI** instead, and is **manually triggered** (Actions tab → "Publish
+to TestPyPI" → *Run workflow*) rather than tag-triggered — TestPyPI also refuses to re-upload an
+existing version, and most commits don't bump `pyproject.toml`'s version, so an automatic trigger
+would fail far more often than it'd succeed.
+
+This is a **separate** Trusted Publisher registration from the real-PyPI one above — same repo,
+but its own workflow filename and environment, set up at
+[test.pypi.org/manage/account/publishing](https://test.pypi.org/manage/account/publishing/):
+
+| Field | Value |
+|---|---|
+| Owner | `BioDataUniMI` |
+| Repository name | `text2cypher-composer` |
+| Workflow name | `publish-testpypi.yml` |
+| Environment name | `testpypi` |
+
+If you already registered one on test.pypi.org pointing at `publish.yml` (the real-PyPI
+workflow's filename), edit it to `publish-testpypi.yml` instead — the workflow filename in the
+Trusted Publisher config must exactly match the file that's actually running, or the OIDC
+exchange fails at publish time.
+
+Once that's set up, running the workflow needs no local `twine`/token at all — though the manual
+local flow (`python -m build && twine upload --repository testpypi dist/*`) still works too, if
+you'd rather not push to GitHub first.
