@@ -47,7 +47,7 @@ def build_rag_example_files(
     limit: int = 5,
     truncate_len: int = 100,
 ) -> RAGExampleFiles:
-    """Materialize a bio2C-style RAG example set from a (question, query) DataFrame.
+    """Materialize a bio2C-style RAG example set from a (question, cypher) DataFrame.
 
     For each row (1-indexed, in row order) writes:
     - `NLquestions/{name}/question_i.txt` — the question;
@@ -62,7 +62,7 @@ def build_rag_example_files(
     not done here.
 
     Args:
-        df: DataFrame with "question" and "query" columns.
+        df: DataFrame with "question" and "cypher" columns.
         name: subfolder name for this example group (e.g. "1hop", "custom").
         database: a Neo4jGraph instance, or a dict with
             uri/username/password/database keys, used to execute each query
@@ -73,8 +73,8 @@ def build_rag_example_files(
         truncate_len: string values longer than this in a query's output are
             truncated (with a trailing "...") to keep output files compact.
     """
-    if "question" not in df.columns or "query" not in df.columns:
-        raise ValueError("`df` must have 'question' and 'query' columns.")
+    if "question" not in df.columns or "cypher" not in df.columns:
+        raise ValueError("`df` must have 'question' and 'cypher' columns.")
 
     graph = resolve_database(database)
     root = Path(root)
@@ -88,7 +88,7 @@ def build_rag_example_files(
     count = 0
     for i, (_, row) in enumerate(df.iterrows(), start=1):
         question = str(row["question"]).strip()
-        cypher = str(row["query"]).strip()
+        cypher = str(row["cypher"]).strip()
 
         (question_dir / f"question_{i}.txt").write_text(question, encoding="utf-8")
         (cypher_dir / f"cypher_{i}.txt").write_text(cypher, encoding="utf-8")

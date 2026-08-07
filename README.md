@@ -229,8 +229,8 @@ import pandas as pd
 from text2cypher_composer import build_rag_example_files, RAGDataset
 
 df = pd.DataFrame([
-    {"question": "How many genes are there?", "query": "MATCH (g:Gene) RETURN count(g) AS c"},
-    {"question": "List all cancers.", "query": "MATCH (c:Cancer) RETURN c.Label AS Cancer"},
+    {"question": "How many genes are there?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"},
+    {"question": "List all cancers.", "cypher": "MATCH (c:Cancer) RETURN c.Label AS Cancer"},
 ])
 
 files = build_rag_example_files(

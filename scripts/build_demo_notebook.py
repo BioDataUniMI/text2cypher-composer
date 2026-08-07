@@ -350,13 +350,13 @@ The RAG techniques (§6) need a `RAGDataset`: a Chroma collection of embedded qu
 the sibling `CypherQueries/`/`Neo4jOutputs/` files holding each one's golden Cypher/output. If
 you don't already have a bio2C-style benchmark on disk, you can build one from your own
 examples in two steps. Here we do it with a small **mock** dataset (5 entries) — in practice
-you'd use your own validated (question, query) pairs, and as many as you like.
+you'd use your own validated (question, cypher) pairs, and as many as you like.
 """)
 
 md("""\
 ### 5.1 A mock example set
 
-A DataFrame with `"question"` and `"query"` columns — the same schema as the running example
+A DataFrame with `"question"` and `"cypher"` columns — the same schema as the running example
 (`Gene`/`miRNA`/`Cancer` nodes, `transcribed_to`/`over_expressed_in` relationships). Some of
 these may return no rows depending on what's actually in the graph — that's fine, it doesn't
 break anything below.
@@ -368,23 +368,23 @@ import pandas as pd
 mock_df = pd.DataFrame([
     {
         "question": "Which cancers show over-expression of miRNA transcribed from the 'MIR411' gene?",
-        "query": "MATCH (g:Gene {Label: 'MIR411'})-[:transcribed_to]->(m:miRNA)-[:over_expressed_in]->(c:Cancer) RETURN c.Label AS Cancer, m.Label AS miRNA",
+        "cypher": "MATCH (g:Gene {Label: 'MIR411'})-[:transcribed_to]->(m:miRNA)-[:over_expressed_in]->(c:Cancer) RETURN c.Label AS Cancer, m.Label AS miRNA",
     },
     {
         "question": "How many genes are there in total?",
-        "query": "MATCH (g:Gene) RETURN count(g) AS GeneCount",
+        "cypher": "MATCH (g:Gene) RETURN count(g) AS GeneCount",
     },
     {
         "question": "List all distinct cancer labels.",
-        "query": "MATCH (c:Cancer) RETURN DISTINCT c.Label AS Cancer",
+        "cypher": "MATCH (c:Cancer) RETURN DISTINCT c.Label AS Cancer",
     },
     {
         "question": "Which miRNAs are transcribed from the gene 'MIR21'?",
-        "query": "MATCH (g:Gene {Label: 'MIR21'})-[:transcribed_to]->(m:miRNA) RETURN m.Label AS miRNA",
+        "cypher": "MATCH (g:Gene {Label: 'MIR21'})-[:transcribed_to]->(m:miRNA) RETURN m.Label AS miRNA",
     },
     {
         "question": "How many miRNAs are over-expressed in 'lung cancer'?",
-        "query": "MATCH (m:miRNA)-[:over_expressed_in]->(c:Cancer {Label: 'lung cancer'}) RETURN count(m) AS Count",
+        "cypher": "MATCH (m:miRNA)-[:over_expressed_in]->(c:Cancer {Label: 'lung cancer'}) RETURN count(m) AS Count",
     },
 ])
 mock_df
@@ -683,7 +683,7 @@ code("""\
 import json, os, tempfile
 from text2cypher_composer import load_finetune_levels
 
-ft_source = mock_df.rename(columns={"query": "cypher"})[["question", "cypher"]]
+ft_source = mock_df[["question", "cypher"]]
 ft_root = tempfile.mkdtemp(prefix="t2c_ft_demo_")
 
 level_paths = {}
@@ -844,7 +844,8 @@ md("""\
 
 `evaluate_technique` runs a technique over a whole gold `(question, query)` set and reports
 Jaro-Winkler, normalized Levenshtein, Jaccard, Coverage, and pass@k. We reuse the mock
-`mock_df` from §5.1 as the gold set — its columns already match (`question`/`query`).
+`mock_df` from §5.1 as the gold set — `evaluate_technique` expects a `"query"` column, so we
+rename `mock_df`'s `"cypher"` column back to it.
 
 Jaccard/Coverage compare the two queries' **result rows**, not their Cypher text (a
 differently-worded but equivalent query should still score well): rows are greedily matched by
@@ -857,8 +858,10 @@ the 1st, or either of the first 2, attempts exactly reproduced the gold result.
 code("""\
 from text2cypher_composer import evaluate_technique
 
+gold_df = mock_df.rename(columns={"cypher": "query"})
+
 report = evaluate_technique(
-    mock_df,
+    gold_df,
     model="gpt-4o",
     database=database,
     technique="vanilla",
