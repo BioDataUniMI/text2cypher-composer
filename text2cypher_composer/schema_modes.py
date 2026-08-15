@@ -2,24 +2,35 @@
 
 Ported from the miRNAKG schema-representation notebook (itself following
 "The Impact of Schema Representation in the Text2Cypher Task",
-https://doi.org/10.48550/arXiv.2505.05118), plus a new LLM-driven pruning mode.
+https://doi.org/10.48550/arXiv.2505.05118), plus a new LLM-driven pruning mode
+and a schema-grounded information-extraction mode (`ie_extraction`).
 
 `exact_match`/`ner_exact_match`/`similarity` need no NLP dependency from this
 package itself — the caller supplies an already-loaded NLP pipeline (e.g. a
 spaCy `Language`) via `nlp`; this module only calls it (`nlp(text)`,
 `nlp.vocab[...]`, token `.similarity()`/`.is_alpha`/`.has_vector`), the same
 duck-typed "bring your own model" pattern `resolve_model` uses for `model`.
+`ie_extraction` follows the same pattern via `ie_engine` — see `ie_prune` —
+though `schemalink_adapter.schemalink_ie_engine()` ships a ready-made one
+backed by the real `schemalink-engine` PyPI package.
 """
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
+import yaml
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from .schema import format_schema, get_schema, get_structured_schema
-from .techniques import SchemaMode, SchemaModeLike
+from .techniques import (
+    DEFAULT_SCHEMA_COMPONENTS,
+    SchemaComponent,
+    SchemaComponentLike,
+    SchemaMode,
+    SchemaModeLike,
+)
 
 
 def _normalize_tokens(text: str) -> List[str]:
@@ -40,17 +51,50 @@ def _mentioned(term: str, question_tokens: List[str], min_len: int = 2) -> bool:
     return any(tok in term_norm for tok in question_tokens if len(tok) >= min_len)
 
 
+def _normalize_components(components: Iterable[SchemaComponentLike]) -> "set[SchemaComponent]":
+    return {SchemaComponent(c) for c in components}
+
+
+def _filter_props(
+    all_props: Dict[str, List[Dict[str, Any]]],
+    keep: Optional[Dict[str, List[str]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Narrow each entry's property list to `keep[key]`, if given.
+
+    `keep=None` leaves every property in place. When `keep` is given but a
+    key's kept-property list is empty (nothing matched), that key's
+    properties are left unfiltered too — an entity/relationship type with no
+    properties left isn't useful, so this favors over- over under-inclusion,
+    mirroring `_apply_selection`'s fallback to the full schema when no label
+    is selected at all.
+    """
+    if keep is None:
+        return all_props
+    result = {}
+    for key, props in all_props.items():
+        kept_names = set(keep.get(key, []))
+        filtered = [p for p in props if p.get("property") in kept_names]
+        result[key] = filtered or props
+    return result
+
+
 def _apply_selection(
     structured_schema: Dict[str, Any],
     node_labels: List[str],
     relationship_types: List[str],
+    node_properties: Optional[Dict[str, List[str]]] = None,
+    relationship_properties: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
     """Build a pruned structured schema from a selected set of labels/rel types.
 
     Falls back to the full, unpruned schema if no known node label was
     selected. Relationships are kept if their type was explicitly selected;
     otherwise (no relationship types selected), a relationship is kept when
-    both its endpoints are among the selected node labels.
+    both its endpoints are among the selected node labels. `node_properties`/
+    `relationship_properties` (label/type -> property names to keep), if
+    given, additionally narrow each selected label's/type's property list
+    (see `_filter_props`); by default every property of a selected label/type
+    is kept, as before.
     """
     node_props = structured_schema.get("node_props", {}) or {}
     selected_nodes = [n for n in node_labels if n in node_props]
@@ -73,20 +117,70 @@ def _apply_selection(
 
     kept_rel_types = {r.get("type") for r in pruned_relationships}
 
+    pruned_node_props = _filter_props({n: node_props[n] for n in selected_nodes}, node_properties)
+    pruned_rel_props = _filter_props(
+        {t: rel_props[t] for t in kept_rel_types if t in rel_props}, relationship_properties
+    )
+
     return {
-        "node_props": {n: node_props[n] for n in selected_nodes},
+        "node_props": pruned_node_props,
         "relationships": pruned_relationships,
-        "rel_props": {t: rel_props[t] for t in kept_rel_types if t in rel_props},
+        "rel_props": pruned_rel_props,
         "metadata": structured_schema.get("metadata", {}),
     }
 
 
-def exact_match_prune(structured_schema: Dict[str, Any], question: str) -> Dict[str, Any]:
-    """Keep node labels mentioned (substring match) in `question`, plus their relationships."""
+def exact_match_prune(
+    structured_schema: Dict[str, Any],
+    question: str,
+    components: Iterable[SchemaComponentLike] = DEFAULT_SCHEMA_COMPONENTS,
+) -> Dict[str, Any]:
+    """Keep schema elements mentioned (substring match) in `question`.
+
+    `components` selects which schema element kinds are matched against the
+    question (see `SchemaComponent`); by default only entity types (node
+    labels) are matched, exactly as before. Node labels always anchor the
+    selection — their matches decide which node types, and (via shared
+    endpoints) which relationships, survive. Enabling `RELATIONSHIP_TYPES`
+    additionally matches relationship type names directly, instead of only
+    inferring kept relationships from selected node labels' endpoints.
+    Enabling `NODE_PROPERTIES`/`RELATIONSHIP_PROPERTIES` additionally narrows
+    each selected label's/type's properties to the ones mentioned.
+    """
+    components = _normalize_components(components)
     q_tokens = _normalize_tokens(question)
     node_props = structured_schema.get("node_props", {}) or {}
-    mentioned = [n for n in node_props if _mentioned(n, q_tokens)]
-    return _apply_selection(structured_schema, mentioned, [])
+    rel_props = structured_schema.get("rel_props", {}) or {}
+
+    mentioned_nodes = [n for n in node_props if _mentioned(n, q_tokens)]
+
+    mentioned_rel_types = (
+        [t for t in rel_props if _mentioned(t, q_tokens)]
+        if SchemaComponent.RELATIONSHIP_TYPES in components
+        else []
+    )
+
+    node_properties = None
+    if SchemaComponent.NODE_PROPERTIES in components:
+        node_properties = {
+            n: [p.get("property") for p in props if _mentioned(p.get("property", ""), q_tokens)]
+            for n, props in node_props.items()
+        }
+
+    relationship_properties = None
+    if SchemaComponent.RELATIONSHIP_PROPERTIES in components:
+        relationship_properties = {
+            t: [p.get("property") for p in props if _mentioned(p.get("property", ""), q_tokens)]
+            for t, props in rel_props.items()
+        }
+
+    return _apply_selection(
+        structured_schema,
+        mentioned_nodes,
+        mentioned_rel_types,
+        node_properties=node_properties,
+        relationship_properties=relationship_properties,
+    )
 
 
 def mask_entities(question: str, nlp: Any) -> str:
@@ -98,9 +192,14 @@ def mask_entities(question: str, nlp: Any) -> str:
     return masked
 
 
-def ner_exact_match_prune(structured_schema: Dict[str, Any], question: str, nlp: Any) -> Dict[str, Any]:
+def ner_exact_match_prune(
+    structured_schema: Dict[str, Any],
+    question: str,
+    nlp: Any,
+    components: Iterable[SchemaComponentLike] = DEFAULT_SCHEMA_COMPONENTS,
+) -> Dict[str, Any]:
     """`exact_match_prune`, but named entities are masked first to reduce value/field-name confusion."""
-    return exact_match_prune(structured_schema, mask_entities(question, nlp))
+    return exact_match_prune(structured_schema, mask_entities(question, nlp), components=components)
 
 
 def similarity_prune(
@@ -186,6 +285,156 @@ def llm_prune(structured_schema: Dict[str, Any], question: str, llm: Any) -> Dic
     return _apply_selection(structured_schema, selection.node_labels, selection.relationship_types)
 
 
+def structured_schema_to_linkml(
+    structured_schema: Dict[str, Any],
+    components: Iterable[SchemaComponentLike] = DEFAULT_SCHEMA_COMPONENTS,
+) -> str:
+    """Convert a structured Neo4j schema into a LinkML YAML schema for `ie_prune`.
+
+    Generated for schema-grounded information extraction (e.g. SchemaLink,
+    https://github.com/BioDataUniMI/schemalink-engine), not for ontology
+    grounding — no `id_prefixes`/`annotations` are emitted, since `ie_prune`
+    only needs entity/relation/attribute *presence*, not links to external
+    ontology IDs.
+
+    Each node label becomes a class (`is_a: NamedEntity`) named *exactly*
+    like the label. If `RELATIONSHIP_TYPES` is in `components`, each
+    relationship type additionally becomes a `Triple` class (named exactly
+    like the type) plus a companion `"{type}__Predicate"` class — using the
+    type's first start/end label pair as the subject/object range (a
+    relationship type connecting more than one label pair only gets its
+    first pair modeled; a documented simplification, not a limitation of the
+    underlying schema). `NODE_PROPERTIES`/`RELATIONSHIP_PROPERTIES`, if in
+    `components`, add each property as an untyped LinkML attribute on the
+    corresponding class.
+
+    This verbatim naming convention (class name == schema label/type) is
+    exactly what `ie_prune` relies on to map the extraction engine's output
+    keys back onto the original schema — don't rename classes downstream
+    without updating `ie_prune` to match.
+    """
+    components = _normalize_components(components)
+    node_props = structured_schema.get("node_props", {}) or {}
+    rel_props = structured_schema.get("rel_props", {}) or {}
+    relationships = structured_schema.get("relationships", []) or []
+
+    classes: Dict[str, Any] = {}
+
+    for label, props in node_props.items():
+        node_class: Dict[str, Any] = {"is_a": "NamedEntity"}
+        if SchemaComponent.NODE_PROPERTIES in components:
+            node_class["attributes"] = {p.get("property"): {} for p in props if p.get("property")}
+        classes[label] = node_class
+
+    if SchemaComponent.RELATIONSHIP_TYPES in components:
+        first_endpoints: Dict[str, Any] = {}
+        for r in relationships:
+            rel_type = r.get("type")
+            if rel_type and rel_type not in first_endpoints:
+                first_endpoints[rel_type] = (r.get("start"), r.get("end"))
+
+        for rel_type, props in rel_props.items():
+            start, end = first_endpoints.get(rel_type, (None, None))
+            predicate_class = f"{rel_type}__Predicate"
+            rel_class: Dict[str, Any] = {
+                "is_a": "Triple",
+                "slot_usage": {
+                    "subject": {"range": start} if start else {},
+                    "object": {"range": end} if end else {},
+                    "predicate": {"range": predicate_class},
+                },
+            }
+            if SchemaComponent.RELATIONSHIP_PROPERTIES in components:
+                rel_class["attributes"] = {p.get("property"): {} for p in props if p.get("property")}
+            classes[rel_type] = rel_class
+            classes[predicate_class] = {
+                "is_a": "RelationshipType",
+                "attributes": {"id": {"pattern": rel_type}},
+            }
+
+    schema = {
+        "id": "https://text2cypher-composer.local/generated-schema",
+        "name": "generated_schema",
+        "imports": ["ontogpt:core", "linkml:types"],
+        "classes": classes,
+    }
+    return yaml.safe_dump(schema, sort_keys=False)
+
+
+def _extraction_mentions(extraction: Dict[str, Any], class_name: str) -> List[Dict[str, Any]]:
+    return (extraction.get(class_name) or {}).get("mentions", []) or []
+
+
+def ie_prune(
+    structured_schema: Dict[str, Any],
+    question: str,
+    ie_engine: Any,
+    components: Iterable[SchemaComponentLike] = DEFAULT_SCHEMA_COMPONENTS,
+) -> Dict[str, Any]:
+    """Keep schema elements a schema-grounded IE engine actually found in `question`.
+
+    Unlike `exact_match_prune`/`ner_exact_match_prune`, this does no substring
+    matching itself: `structured_schema_to_linkml` turns `structured_schema`
+    into a LinkML schema (restricted to what `components` asks for — see
+    `SchemaComponent`), and `ie_engine` is called as `ie_engine(schema_yaml,
+    question)`, the same "bring your own object" duck-typed pattern `nlp`/
+    `llm` use elsewhere in this module. It must return a dict shaped like
+    SchemaLink's (https://github.com/BioDataUniMI/schemalink-engine) output:
+    `{class_name: {"mentions": [{...}, ...]}}`, one entry per class that was
+    actually asked for, with an empty (or absent) `"mentions"` list for a
+    class found nowhere in the text — the ontology-grounding fields
+    SchemaLink can add to each mention (`"id"`, etc.) are ignored here.
+
+    Node labels/relationship types are kept when their (verbatim-named)
+    class has at least one mention. `NODE_PROPERTIES`/`RELATIONSHIP_PROPERTIES`
+    narrow a kept label's/type's properties to whichever property names
+    appear as keys in its mentions — as with `_apply_selection` generally, a
+    label/type with no property keys found keeps every property, rather than
+    being left with none.
+
+    `schemalink_ie_engine()` (see `schemalink_adapter`) is a ready-made
+    `ie_engine` backed by the real `schemalink-engine` PyPI package
+    (`pip install schemalink-engine`) satisfying this exact contract — pass
+    its result straight through as `ie_engine`.
+    """
+    components = _normalize_components(components)
+    schema_yaml = structured_schema_to_linkml(structured_schema, components)
+    extraction = ie_engine(schema_yaml, question)
+
+    node_props = structured_schema.get("node_props", {}) or {}
+    rel_props = structured_schema.get("rel_props", {}) or {}
+
+    node_labels = [n for n in node_props if _extraction_mentions(extraction, n)]
+
+    relationship_types = (
+        [t for t in rel_props if _extraction_mentions(extraction, t)]
+        if SchemaComponent.RELATIONSHIP_TYPES in components
+        else []
+    )
+
+    def _mentioned_properties(class_name: str, props: List[Dict[str, Any]]) -> List[str]:
+        keys_seen: set = set()
+        for mention in _extraction_mentions(extraction, class_name):
+            keys_seen.update(mention.keys())
+        return [p.get("property") for p in props if p.get("property") in keys_seen]
+
+    node_properties = None
+    if SchemaComponent.NODE_PROPERTIES in components:
+        node_properties = {n: _mentioned_properties(n, props) for n, props in node_props.items()}
+
+    relationship_properties = None
+    if SchemaComponent.RELATIONSHIP_PROPERTIES in components:
+        relationship_properties = {t: _mentioned_properties(t, props) for t, props in rel_props.items()}
+
+    return _apply_selection(
+        structured_schema,
+        node_labels,
+        relationship_types,
+        node_properties=node_properties,
+        relationship_properties=relationship_properties,
+    )
+
+
 def resolve_schema_text(
     graph: Any,
     mode: SchemaModeLike,
@@ -193,8 +442,14 @@ def resolve_schema_text(
     llm: Optional[Any] = None,
     nlp: Optional[Any] = None,
     similarity_threshold: float = 0.5,
+    schema_components: Iterable[SchemaComponentLike] = DEFAULT_SCHEMA_COMPONENTS,
+    ie_engine: Optional[Any] = None,
 ) -> str:
-    """Compute the schema text to place in the prompt, per `mode` (see `SchemaMode`)."""
+    """Compute the schema text to place in the prompt, per `mode` (see `SchemaMode`).
+
+    `schema_components` is only used by `mode="exact_match"`/`"ner_exact_match"`/
+    `"ie_extraction"` (see `SchemaComponent`); ignored otherwise.
+    """
     mode = SchemaMode(mode)
 
     if mode == SchemaMode.SCHEMA:
@@ -205,7 +460,9 @@ def resolve_schema_text(
 
     if mode == SchemaMode.EXACT_MATCH:
         structured = get_structured_schema(graph, is_enhanced=True)
-        return format_schema(exact_match_prune(structured, question), is_enhanced=True)
+        return format_schema(
+            exact_match_prune(structured, question, components=schema_components), is_enhanced=True
+        )
 
     if mode == SchemaMode.NER_EXACT_MATCH:
         if nlp is None:
@@ -214,7 +471,9 @@ def resolve_schema_text(
                 "pipeline with named-entity recognition (e.g. spaCy's en_ner_bionlp13cg_md)."
             )
         structured = get_structured_schema(graph, is_enhanced=True)
-        return format_schema(ner_exact_match_prune(structured, question, nlp), is_enhanced=True)
+        return format_schema(
+            ner_exact_match_prune(structured, question, nlp, components=schema_components), is_enhanced=True
+        )
 
     if mode == SchemaMode.SIMILARITY:
         if nlp is None:
@@ -232,5 +491,19 @@ def resolve_schema_text(
             raise ValueError("schema_mode='llm_pruning' requires a structured-output-capable model.")
         structured = get_structured_schema(graph, is_enhanced=True)
         return format_schema(llm_prune(structured, question, llm), is_enhanced=True)
+
+    if mode == SchemaMode.IE_EXTRACTION:
+        if ie_engine is None:
+            raise ValueError(
+                "schema_mode='ie_extraction' requires an `ie_engine` argument: a callable "
+                "ie_engine(schema_yaml, question) -> dict performing schema-grounded "
+                "information extraction — pass schemalink_ie_engine() for a ready-made one "
+                "backed by the real schemalink-engine package (pip install schemalink-engine), "
+                "or see `ie_prune` for the contract to implement your own."
+            )
+        structured = get_structured_schema(graph, is_enhanced=True)
+        return format_schema(
+            ie_prune(structured, question, ie_engine, components=schema_components), is_enhanced=True
+        )
 
     raise ValueError(f"Unknown schema_mode: {mode}")

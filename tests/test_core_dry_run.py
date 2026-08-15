@@ -15,7 +15,7 @@ FAKE_MODEL = RunnableLambda(_boom)
 
 def test_dry_run_builds_prompt_without_generating_or_executing():
     with patch("text2cypher_composer.core.resolve_database", return_value=MagicMock()) as resolve_db, \
-         patch("text2cypher_composer.core.execute_cypher") as exec_cypher, \
+         patch("text2cypher_composer.core.execute_cypher_with_warnings") as exec_cypher, \
          patch("text2cypher_composer.core.validate_cypher") as validate:
         result = run(
             input_NL="How many genes are there?",
@@ -36,12 +36,14 @@ def test_dry_run_builds_prompt_without_generating_or_executing():
     assert result.validation is None
     assert result.result is None
     assert "How many genes are there?" in result.prompt[-1]["content"]
+    assert result.prompt_tokens is None or result.prompt_tokens > 0
+    assert result.rescue_prompt_tokens == []
 
 
 def test_dry_run_still_resolves_schema_for_schema_techniques():
     with patch("text2cypher_composer.core.resolve_database", return_value=MagicMock()), \
          patch("text2cypher_composer.core.resolve_schema_text", return_value="Node labels: Gene") as resolve_schema, \
-         patch("text2cypher_composer.core.execute_cypher") as exec_cypher, \
+         patch("text2cypher_composer.core.execute_cypher_with_warnings") as exec_cypher, \
          patch("text2cypher_composer.core.validate_cypher") as validate:
         result = run(
             input_NL="How many genes?",

@@ -28,7 +28,13 @@ class QuestionEvaluation:
     `coverage == 1.0`; `pass_at(j)` folds `passes[:j]` into "at least one of
     the first j attempts passed". `extra` is any `df` columns other than
     "question"/"query" (e.g. bio2C's "ID"/"level"), carried through unchanged
-    for traceability in `to_dataframe()`.
+    for traceability in `to_dataframe()`. `rescued`/`rescue_attempts`/
+    `rescue_error_messages`/`rescue_prompts`/`rescue_prompt_tokens`/
+    `execution_error`/`execution_warnings`/`prompt_tokens` proxy the first
+    attempt's (see `Text2CypherResult`) — the `rescue_*` ones are only
+    meaningful when `evaluate_technique` was called with `rescue_prompt=True`;
+    `execution_error`/`execution_warnings`/`prompt_tokens` are populated
+    regardless.
     """
 
     question: str
@@ -44,6 +50,38 @@ class QuestionEvaluation:
 
     def pass_at(self, j: int) -> bool:
         return any(self.passes[:j])
+
+    @property
+    def rescued(self) -> bool:
+        return self.attempts[0].rescued
+
+    @property
+    def rescue_attempts(self) -> int:
+        return self.attempts[0].rescue_attempts
+
+    @property
+    def rescue_error_messages(self) -> List[str]:
+        return self.attempts[0].rescue_error_messages
+
+    @property
+    def rescue_prompts(self) -> List[List[Dict[str, str]]]:
+        return self.attempts[0].rescue_prompts
+
+    @property
+    def rescue_prompt_tokens(self) -> List[Optional[int]]:
+        return self.attempts[0].rescue_prompt_tokens
+
+    @property
+    def execution_error(self) -> Optional[str]:
+        return self.attempts[0].execution_error
+
+    @property
+    def execution_warnings(self) -> List[str]:
+        return self.attempts[0].execution_warnings
+
+    @property
+    def prompt_tokens(self) -> Optional[int]:
+        return self.attempts[0].prompt_tokens
 
 
 @dataclass
@@ -70,11 +108,24 @@ class EvaluationReport:
         """Flatten `details` into one row per question, with a pass@j column for every j in 1..k.
 
         Beyond the core metrics, each row also carries: any `extra` columns
-        from the input `df` (e.g. bio2C's "ID"/"level"); `prompt`, the exact
-        messages sent for the first attempt; `gold_data`/`predicted_data`,
-        the gold/generated query's result rows; and
-        `retrieved_example_ids`/`retrieved_example_distances` for RAG
-        techniques (`None` otherwise) — see `Text2CypherResult.retrieved_examples`.
+        from the input `df` (e.g. bio2C's "ID"/"level"); `prompt`/
+        `prompt_tokens`, the exact messages sent for the first attempt and
+        their `tiktoken` token count (`None` if `tiktoken` isn't installed —
+        handy for comparing prompt size across `technique`/`schema_mode`,
+        e.g. how much schema filtering saves); `gold_data`/`predicted_data`,
+        the gold/generated query's result rows; `execution_error`/
+        `execution_warnings` (the native Neo4j error/notifications from the
+        first attempt's actual execution, populated regardless of
+        `rescue_prompt`); `rescued`/`rescue_attempts` (how many retries the
+        first attempt needed to stop failing/coming back empty, when
+        `evaluate_technique` was called with `rescue_prompt=True` —
+        `0`/`False` otherwise), `rescue_error_messages`/`rescue_prompts` (the
+        `error_message`/fully-instantiated messages sent for each retry) and
+        `rescue_prompt_tokens` (their token counts — a list of
+        `rescue_attempts` numbers, handy for tallying how many extra tokens
+        `rescue_prompt` costs); and `retrieved_example_ids`/
+        `retrieved_example_distances` for RAG techniques (`None` otherwise) —
+        see `Text2CypherResult.retrieved_examples`.
         """
         k = self.summary.k
         rows = []
@@ -96,8 +147,16 @@ class EvaluationReport:
             for j in range(1, k + 1):
                 row[f"pass@{j}"] = d.pass_at(j)
             row["prompt"] = first.prompt
+            row["prompt_tokens"] = first.prompt_tokens
             row["gold_data"] = d.gold_data
             row["predicted_data"] = predicted_data
+            row["execution_error"] = first.execution_error
+            row["execution_warnings"] = first.execution_warnings
+            row["rescued"] = first.rescued
+            row["rescue_attempts"] = first.rescue_attempts
+            row["rescue_error_messages"] = first.rescue_error_messages
+            row["rescue_prompts"] = first.rescue_prompts
+            row["rescue_prompt_tokens"] = first.rescue_prompt_tokens
             row["retrieved_example_ids"] = retrieved.get("example_ids")
             row["retrieved_example_distances"] = retrieved.get("example_distances")
             rows.append(row)
@@ -111,6 +170,8 @@ def evaluate_technique(
     technique: str,
     dataset: Optional[DatasetLike] = None,
     k: int = 1,
+    rescue_prompt: bool = False,
+    max_retries: int = 1,
 ) -> EvaluationReport:
     """Evaluate `technique` in bulk over a gold (question, query) test set.
 
@@ -136,6 +197,14 @@ def evaluate_technique(
         k: number of independent generation attempts per question. Defaults
             to 1 (only `pass@1` is reported); use a larger `k` to also get
             `pass@2`, ..., `pass@k`.
+        rescue_prompt, max_retries: forwarded to `run()` for every attempt —
+            if `rescue_prompt` is True, an attempt that fails to execute or
+            comes back empty is retried (up to `max_retries` times) with the
+            error-aware fix-up prompt (see `run()`). `QuestionEvaluation.rescued`
+            /`.rescue_attempts` (and the `rescued`/`rescue_attempts` columns
+            in `to_dataframe()`) report, per question, whether and how many
+            retries the *first* attempt needed to stop failing/coming back
+            empty.
 
     Returns:
         An EvaluationReport: a dataset-level `summary` (mean metrics plus
@@ -163,7 +232,15 @@ def evaluate_technique(
         attempts: List[Text2CypherResult] = []
         attempt_coverages: List[float] = []
         for _ in range(k):
-            result = run(question, model, database=graph, technique=technique, dataset=dataset)
+            result = run(
+                question,
+                model,
+                database=graph,
+                technique=technique,
+                dataset=dataset,
+                rescue_prompt=rescue_prompt,
+                max_retries=max_retries,
+            )
             attempts.append(result)
             pred_data = result.result if result.executed else []
             attempt_coverages.append(coverage_similarity(gold_cypher, gold_data, result.cypher, pred_data))

@@ -104,27 +104,47 @@ input_NL = "How many miRNAs have the keyword 'precursor' in the label and a sequ
 """)
 
 code("""\
+def _print_messages(messages):
+    for message in messages:
+        print(f"  [{message['role']}]")
+        for line in message["content"].splitlines():
+            print(f"    {line}")
+
 def show(result, show_prompt=False):
     \"\"\"Pretty-print a Text2CypherResult.
 
     CyVer validation (syntax validity, schema-alignment score, property-access
     score) is run on every generated query and is always printed, regardless
     of whether the query executed. The result rows are printed too, if the
-    query executed successfully.
+    query executed successfully. `execution_error`/`execution_warnings` — the
+    native Neo4j error/notifications from the *final* attempt's actual
+    execution — are always printed too, independently of rescue_prompt.
 
-    `result.prompt` — the exact messages sent to the model, with all
-    placeholders (schema, examples, question) already substituted in — is
-    always available on every result; pass show_prompt=True to print it.
+    `result.prompt` is the exact messages sent for the *initial* generation
+    attempt; if rescued, `result.rescue_prompts` holds one more fully-
+    instantiated prompt per rescue attempt. pass show_prompt=True to print
+    all of them (not just the initial one). `result.prompt_tokens` (via
+    tiktoken, None if it isn't installed) is the initial prompt's token
+    count — handy for comparing prompt size across technique/schema_mode
+    (how much schema filtering saves); `result.rescue_prompt_tokens` is the
+    parallel per-attempt count for rescue_prompts (a list of rescue_attempts
+    numbers when rescued — how many extra tokens rescue_prompt costs).
     \"\"\"
     print(f"Technique:        {result.technique}")
     print(f"Model:            {result.model}")
+    print(f"Prompt tokens:    {result.prompt_tokens}")
 
     if show_prompt:
-        print("\\nFull instantiated prompt:")
-        for message in result.prompt:
-            print(f"  [{message['role']}]")
-            for line in message["content"].splitlines():
-                print(f"    {line}")
+        all_prompts = [result.prompt] + result.rescue_prompts
+        if len(all_prompts) == 1:
+            print("\\nFull instantiated prompt:")
+            _print_messages(all_prompts[0])
+        else:
+            print(f"\\nFull instantiated prompts ({len(all_prompts)}: 1 initial + {len(all_prompts) - 1} rescue):")
+            for i, messages in enumerate(all_prompts):
+                label = "initial" if i == 0 else f"rescue attempt {i}"
+                print(f"  --- {label} ---")
+                _print_messages(messages)
 
     if result.dry_run:
         print("\\n[dry_run] Nothing was generated, executed, or validated — prompt only.")
@@ -139,7 +159,14 @@ def show(result, show_prompt=False):
         if len(result.result) > 5:
             print(f"  ... and {len(result.result) - 5} more rows")
     else:
-        print("Execution FAILED (see CyVer report below for why).")
+        print("Execution FAILED (see execution_error/CyVer report below for why).")
+
+    if result.execution_error:
+        print(f"\\nExecution error: {result.execution_error}")
+    if result.execution_warnings:
+        print("Execution warnings (Neo4j notifications):")
+        for warning in result.execution_warnings:
+            print(f"  {warning}")
 
     v = result.validation
     print("\\nCyVer validation report:")
@@ -152,6 +179,14 @@ def show(result, show_prompt=False):
     print(f"  Properties score:  {v.properties_score}")
     if v.properties_metadata:
         print(f"  Property issues:   {v.properties_metadata}")
+
+    if result.rescue_error_messages:
+        print(f"\\nRescue attempts: {result.rescue_attempts}")
+        print(f"Rescue prompt tokens: {result.rescue_prompt_tokens}")  # a list of rescue_attempts numbers
+        for i, msg in enumerate(result.rescue_error_messages, start=1):
+            print(f"  [attempt {i}] error_message sent to the fix-up prompt:")
+            for line in msg.splitlines():
+                print(f"    {line}")
 """)
 
 md("""\
@@ -265,6 +300,73 @@ print(result_exact_match.schema)
 """)
 
 md("""\
+### 4.3.1 `schema_components` — choosing which schema elements are matched
+
+By default, `"exact_match"` (and `"ner_exact_match"`, `"ie_extraction"`) only match **entity
+types** (node labels) against the question, as in 4.3 above. `schema_components` widens that to
+relationship types and/or node/relationship properties — see `SchemaComponent`. Entity types
+always anchor the selection; the other components only narrow further what's kept once a label
+is selected. Compare each pruned schema below to 4.3's (entity types only).
+""")
+
+code("""\
+from text2cypher_composer import list_schema_components
+
+list_schema_components()
+""")
+
+code("""\
+# Entity types (default) + relationship types: a relationship is now kept when its *type* is
+# mentioned in the question, not just when both its endpoint labels are.
+result_components_rel = run(
+    input_NL=input_NL,
+    model="gpt-4o",
+    database=database,
+    technique="Schema",
+    schema_mode="exact_match",
+    schema_components=["entity_types", "relationship_types"],
+)
+show(result_components_rel)
+
+print("\\n--- Pruned schema (+ relationship_types) ---")
+print(result_components_rel.schema)
+""")
+
+code("""\
+# Entity types + node properties: each selected label's properties are narrowed down to the
+# ones actually mentioned in the question (falling back to all of them if none are).
+result_components_node_props = run(
+    input_NL=input_NL,
+    model="gpt-4o",
+    database=database,
+    technique="Schema",
+    schema_mode="exact_match",
+    schema_components=["entity_types", "node_properties"],
+)
+show(result_components_node_props)
+
+print("\\n--- Pruned schema (+ node_properties) ---")
+print(result_components_node_props.schema)
+""")
+
+code("""\
+# Entity types + relationship properties: same narrowing, but for the properties of any kept
+# relationship type.
+result_components_rel_props = run(
+    input_NL=input_NL,
+    model="gpt-4o",
+    database=database,
+    technique="Schema",
+    schema_mode="exact_match",
+    schema_components=["entity_types", "relationship_properties"],
+)
+show(result_components_rel_props)
+
+print("\\n--- Pruned schema (+ relationship_properties) ---")
+print(result_components_rel_props.schema)
+""")
+
+md("""\
 ### 4.4 `"ner_exact_match"` — NER-masked pruning
 
 Same as `"exact_match"`, but named entities in the question are first masked with their entity
@@ -341,6 +443,121 @@ show(result_llm_pruning)
 
 print("\\n--- LLM-pruned schema ---")
 print(result_llm_pruning.schema)
+""")
+
+md("""\
+### 4.7 `"ie_extraction"` — schema-grounded information extraction
+
+Instead of substring-matching the question against schema names, `"ie_extraction"` runs
+schema-grounded **information extraction** (NER for entity types, relation extraction for
+relationship types, and — if requested via `schema_components` — attribute extraction for
+properties) over the question, via a user-supplied `ie_engine`, and keeps exactly what it found.
+
+`structured_schema_to_linkml` first converts the graph's structured schema into a
+[LinkML](https://linkml.io/) YAML schema (class names match the Neo4j labels/types/properties
+*verbatim* — no ontology grounding, since `ie_prune` only needs entity/relation/attribute
+presence). `ie_engine` is then called as `ie_engine(schema_yaml, question)` and must return a
+dict shaped like [SchemaLink](https://github.com/BioDataUniMI/schemalink-engine)'s output:
+`{class_name: {"mentions": [{...}, ...]}}`.
+
+`schemalink_ie_engine()` is a ready-made `ie_engine` backed by the real `schemalink-engine`
+package (`pip install schemalink-engine`, then `schemalink api-key set sk-...`):
+
+```python
+from text2cypher_composer import schemalink_ie_engine
+
+result = run(
+    input_NL=input_NL,
+    model="gpt-4o",
+    database=database,
+    technique="Schema",
+    schema_mode="ie_extraction",
+    schema_components=["entity_types"],
+    ie_engine=schemalink_ie_engine(),  # include_node_types/include_relationship_types/
+)                                      # include_properties booleans filter what's asked for
+```
+
+The cells below use a tiny **stand-in** `ie_engine` instead (a canned dict, not a real
+extraction call) so this notebook runs without a SchemaLink install/OpenAI-billed extraction
+call — the mechanics (what `ie_prune` does with the output) are identical either way. See the
+README's `ie_engine` section for the exact contract `schemalink_ie_engine()` satisfies.
+""")
+
+code("""\
+# A small mock structured schema (Gene/miRNA/transcribed_to, same shapes as §5.1's mock RAG
+# dataset) -- used here instead of the live database schema so the property names below are
+# guaranteed to match, with no dependency on what's actually in the graph.
+mock_structured_schema = {
+    "node_props": {
+        "Gene": [{"property": "Label", "type": "STRING"}],
+        "miRNA": [
+            {"property": "Label", "type": "STRING"},
+            {"property": "sequence_size", "type": "INTEGER"},
+        ],
+    },
+    "rel_props": {
+        "transcribed_to": [{"property": "source", "type": "STRING"}],
+    },
+    "relationships": [{"start": "Gene", "type": "transcribed_to", "end": "miRNA"}],
+    "metadata": {},
+}
+
+from text2cypher_composer import structured_schema_to_linkml
+
+print(structured_schema_to_linkml(
+    mock_structured_schema,
+    components=["entity_types", "relationship_types", "node_properties", "relationship_properties"],
+))
+""")
+
+code("""\
+from text2cypher_composer import ie_prune
+
+def stub_ie_engine(schema_yaml, question):
+    \"\"\"Stand-in for a real SchemaLink adapter -- same output shape, canned instead of extracted.\"\"\"
+    return {
+        "miRNA": {"mentions": [{"Label": "precursor", "sequence_size": "100"}]},
+        "Gene": {"mentions": []},          # not mentioned in the question -> pruned out
+        "transcribed_to": {"mentions": []},  # ditto
+    }
+
+ie_question = "How many miRNAs have the keyword 'precursor' in the label and a sequence size under 100 nucleotides?"
+
+pruned = ie_prune(
+    mock_structured_schema,
+    ie_question,
+    stub_ie_engine,
+    components=["entity_types", "relationship_types", "node_properties"],
+)
+pruned
+# -> only "miRNA" survives (the only class with mentions), narrowed to the "Label"/"sequence_size"
+#    properties actually present in its mention -- "Gene" and "transcribed_to" are pruned out
+#    entirely, same as an unmentioned label in "exact_match".
+""")
+
+md("""\
+And through `run()`, exactly like every other `schema_mode` (using the same stand-in engine,
+restricted to `entity_types` here since it only needs to get the live database's actual node
+labels right, which — unlike the mock schema above — this demo doesn't control):
+""")
+
+code("""\
+def live_stub_ie_engine(schema_yaml, question):
+    return {"miRNA": {"mentions": [{"Label": "precursor"}]}}
+
+result_ie = run(
+    input_NL=input_NL,
+    model="gpt-4o",
+    database=database,
+    technique="Schema",
+    schema_mode="ie_extraction",
+    schema_components=["entity_types"],
+    ie_engine=live_stub_ie_engine,
+)
+show(result_ie)
+
+print("\\n--- IE-pruned schema ---")
+print(result_ie.schema)
 """)
 
 md("""\
@@ -615,10 +832,14 @@ md("""\
 `rescue_prompt=True` (default `False`) retries a query that fails to execute or comes back empty
 with a second "fix this query" prompt — reusing the same schema/examples context as the
 technique, plus the bad query and an `error_message`. Ported from the miRNAKG rescue-prompt
-notebook, with one change: `error_message` is built from **CyVer's validation report** (both its
-warning-level notifications and hard errors), which `run()` already computes for every query,
-rather than from a raw Neo4j exception string. `max_retries` (default `1`) caps how many rescue
-attempts are made, stopping early once one succeeds.
+notebook, and `error_message` concatenates every signal available about the failure: the native
+Neo4j error (if the query didn't execute), any Neo4j notifications observed during execution
+(deprecated syntax, unknown labels/relationship-types/properties, cartesian products, ...) —
+captured the same way the notebook's `execute_query_with_warnings` did — an `"Empty result
+set."` note if it executed but returned nothing, and **CyVer's validation report** (both its
+warning-level notifications and hard errors), which `run()` already computes for every query.
+`max_retries` (default `1`) caps how many rescue attempts are made, stopping early once one
+succeeds.
 
 We reuse the same deliberately-broken query from §7, via a fake "model" that returns it on the
 *first* call only — every call after (i.e. the rescue attempt) returns a working query — so we
@@ -648,7 +869,7 @@ result_rescued = run(
 print("Initial cypher:", result_rescued.initial_cypher)
 print("Final cypher:  ", result_rescued.cypher)
 print("Rescued:", result_rescued.rescued, "| attempts:", result_rescued.rescue_attempts)
-show(result_rescued)
+show(result_rescued, show_prompt=True)  # show_prompt=True: prints the initial prompt *and* every rescue prompt
 """)
 
 md("""\
@@ -853,6 +1074,12 @@ similarity before comparing, since Neo4j doesn't guarantee row order without `OR
 
 With `k=2`, each question gets 2 independent generation attempts; `pass@1`/`pass@2` say whether
 the 1st, or either of the first 2, attempts exactly reproduced the gold result.
+
+`rescue_prompt`/`max_retries` (§8) are forwarded to every attempt too; `report.to_dataframe()`
+then carries `execution_error`/`execution_warnings` (populated regardless of `rescue_prompt`),
+`rescued`/`rescue_attempts`/`rescue_error_messages`/`rescue_prompts` per question, and
+`prompt_tokens`/`rescue_prompt_tokens` (via `tiktoken`) so you can see how much the rescue prompt
+is pulling its weight — and costing in tokens — across a whole gold set, not just one query.
 """)
 
 code("""\
@@ -866,13 +1093,23 @@ report = evaluate_technique(
     database=database,
     technique="vanilla",
     k=2,
+    rescue_prompt=True,
+    max_retries=2,
 )
 
 print(report.summary)
 """)
 
 code("""\
-report.to_dataframe()
+eval_df = report.to_dataframe()
+eval_df
+""")
+
+code("""\
+eval_df[[
+    "question", "prompt_tokens", "execution_error", "execution_warnings",
+    "rescued", "rescue_attempts", "rescue_error_messages", "rescue_prompts", "rescue_prompt_tokens",
+]]
 """)
 
 md("""\
@@ -890,13 +1127,30 @@ md("""\
   attempt.
 - `schema_mode` (§4) controls how the schema is derived/pruned for schema-using techniques:
   `"schema"` (default), `"enhanced"`, `"exact_match"`, `"ner_exact_match"`, `"similarity"`
-  (the latter two need a user-supplied `nlp` pipeline), or `"llm_pruning"`.
+  (the latter two need a user-supplied `nlp` pipeline), `"llm_pruning"`, or `"ie_extraction"`
+  (§4.7, needs an `ie_engine` — `schemalink_ie_engine()` is a ready-made one backed by the real
+  `schemalink-engine` package, `pip install schemalink-engine`).
+- `schema_components` (§4.3.1) narrows `"exact_match"`/`"ner_exact_match"`/`"ie_extraction"` down
+  to (or, for `"ie_extraction"`, up from) entity types only, the default — any combination of
+  `"entity_types"`, `"relationship_types"`, `"node_properties"`, `"relationship_properties"`
+  (see `SchemaComponent`/`list_schema_components()`).
 - `dry_run=True` (§3.1) builds and returns `prompt` (schema/RAG resolved) without generating,
   executing, or validating anything — `cypher`/`result`/`validation` stay `None`. Incompatible
   with `rescue_prompt=True`.
-- `rescue_prompt=True` (§8) retries a failed/empty query with a CyVer-error-aware fix-up prompt,
-  up to `max_retries` (default `1`) times — `result.rescued`/`result.rescue_attempts` report
-  whether and how many times that happened.
+- `execution_error`/`execution_warnings` (the native Neo4j error/notifications from the *final*
+  attempt's actual execution) are always populated on every `Text2CypherResult`, independently of
+  `rescue_prompt`.
+- `rescue_prompt=True` (§8) retries a failed/empty query with a fix-up prompt whose
+  `error_message` concatenates the native Neo4j error, execution warnings, and CyVer's report, up
+  to `max_retries` (default `1`, must be `>= 1`) times — `result.rescued`/`result.rescue_attempts`
+  report whether and how many times that happened; `result.rescue_error_messages`/
+  `result.rescue_prompts` hold, per attempt, the `error_message` sent and the exact
+  fully-instantiated messages sent for it.
+- `result.prompt_tokens` (via `tiktoken`, `None` if it isn't installed) is the initial prompt's
+  token count — compare it across `technique`/`schema_mode` to see how many tokens schema
+  filtering actually saves; `result.rescue_prompt_tokens` is the parallel per-attempt count for
+  `rescue_prompts` — a list of `rescue_attempts` numbers, to see how many extra tokens
+  `rescue_prompt` costs.
 - Fine-tuning (§9): `load_finetune_levels`/`max_cypher_tokens`/`split_finetune_dataset` prepare a
   leveled gold dataset, `write_local_finetune_dataset`/`build_gpt_finetune_jsonl` export it for
   `finetune_lora` (LoRA-finetune a local model) or OpenAI's fine-tuning GUI respectively; either
@@ -915,6 +1169,10 @@ md("""\
 - `evaluate_technique()` (§11) runs a technique over a gold test set and reports
   Jaro-Winkler, Levenshtein, Jaccard, Coverage, and pass@k as an `EvaluationReport`
   (`.summary` for dataset-level averages, `.to_dataframe()` for a per-question table).
+  `rescue_prompt`/`max_retries` forward to every attempt, and `.to_dataframe()`/
+  `save_evaluation_report()`'s `.pkl`/`.xlsx` then carry `execution_error`/`execution_warnings`,
+  `rescued`/`rescue_attempts`/`rescue_error_messages`/`rescue_prompts`, and
+  `prompt_tokens`/`rescue_prompt_tokens` per question.
 """)
 
 nb["cells"] = cells

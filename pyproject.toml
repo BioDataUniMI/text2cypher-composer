@@ -35,6 +35,7 @@ dependencies = [
     "CyVer>=2.0.0,<3",
     "pandas>=2.0",
     "textdistance>=4.6",
+    "PyYAML>=6",
 ]
 
 [project.optional-dependencies]
@@ -56,6 +57,7 @@ local-embeddings = [
     "sentence-transformers>=2.2",
     "langchain-huggingface>=0.0.3",
 ]
+schemalink = ["schemalink-engine>=0.1"]
 test = ["pytest>=7"]
 
 [project.urls]

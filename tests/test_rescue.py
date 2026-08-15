@@ -50,6 +50,42 @@ def test_build_error_message_falls_back_when_nothing_to_report():
     assert msg  # non-empty, doesn't crash on the "no issues" case
 
 
+def test_build_error_message_includes_native_execution_error():
+    msg = build_error_message(
+        False, None, _validation(), execution_error="Cypher syntax error: Invalid input 'x'"
+    )
+    assert "Cypher syntax error: Invalid input 'x'" in msg
+
+
+def test_build_error_message_includes_execution_warnings():
+    msg = build_error_message(
+        True,
+        [{"c": 1}],
+        _validation(),
+        execution_warnings=["Warning: unknown label - Position: line 1, column 8"],
+    )
+    assert "Warning: unknown label - Position: line 1, column 8" in msg
+
+
+def test_build_error_message_concatenates_execution_and_cyver_signals():
+    validation = _validation(
+        syntax_valid=False,
+        syntax_metadata=[{"code": "SYN001", "description": "bad syntax"}],
+    )
+    msg = build_error_message(
+        False,
+        None,
+        validation,
+        execution_error="Neo4j runtime error: boom",
+        execution_warnings=["Warning: deprecated - Position: line 1, column 1"],
+    )
+    assert "Neo4j runtime error: boom" in msg
+    assert "Warning: deprecated - Position: line 1, column 1" in msg
+    assert "SYN001" in msg and "bad syntax" in msg
+    # native error should lead, so it's the most prominent part of the prompt
+    assert msg.index("Neo4j runtime error: boom") < msg.index("SYN001")
+
+
 def test_rescue_messages_dispatch_by_technique_flags():
     vanilla = rescue_messages(uses_schema=False, uses_rag=False)
     schema = rescue_messages(uses_schema=True, uses_rag=False)

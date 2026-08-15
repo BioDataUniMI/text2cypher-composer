@@ -6,14 +6,12 @@
 [![GitHub Action: Publish to PyPI](https://github.com/BioDataUniMI/text2cypher-composer/actions/workflows/publish.yml/badge.svg)](https://github.com/BioDataUniMI/text2cypher-composer/actions/workflows/publish.yml)
 
 <!-- Quality/coverage badges below are placeholders — this project isn't registered on
-     SonarCloud/Codacy/Code Climate yet. Replace the project key / badge ID in each URL
-     (and set up the corresponding integration) before relying on them; until then they'll
-     show as broken/"unknown". Coveralls' URL is already valid as-is (no token needed), it
-     just needs Coveralls enabled for this repo. -->
+     SonarCloud/Codacy yet. Replace the project key / badge ID in each URL (and set up the
+     corresponding integration) before relying on them; until then they'll show as
+     broken/"unknown". Coveralls' URL is already valid as-is (no token needed), it just
+     needs Coveralls enabled for this repo. -->
 [![SonarCloud Quality](https://sonarcloud.io/api/project_badges/measure?project=BioDataUniMI_text2cypher-composer&metric=alert_status)](https://sonarcloud.io/dashboard?id=BioDataUniMI_text2cypher-composer)
 [![Codacy Maintainability](https://app.codacy.com/project/badge/Grade/REPLACE_WITH_CODACY_BADGE_ID)](https://www.codacy.com/gh/BioDataUniMI/text2cypher-composer/dashboard)
-[![Maintainability](https://api.codeclimate.com/v1/badges/REPLACE_WITH_CODECLIMATE_ID/maintainability)](https://codeclimate.com/github/BioDataUniMI/text2cypher-composer/maintainability)
-[![Code Climate Coverage](https://api.codeclimate.com/v1/badges/REPLACE_WITH_CODECLIMATE_ID/test_coverage)](https://codeclimate.com/github/BioDataUniMI/text2cypher-composer/test_coverage)
 [![Coveralls Coverage](https://coveralls.io/repos/github/BioDataUniMI/text2cypher-composer/badge.svg?branch=main)](https://coveralls.io/github/BioDataUniMI/text2cypher-composer?branch=main)
 
 Translate a natural-language question into an executable Cypher query and run it
@@ -64,6 +62,14 @@ Embedding a RAG dataset with a local HuggingFace/sentence-transformers model ins
 pip install "text2cypher-composer[local-embeddings]"
 ```
 
+Using `schema_mode="ie_extraction"` with the ready-made `schemalink_ie_engine()` (instead of
+bringing your own `ie_engine`) needs an extra too, plus an OpenAI API key configured for it
+(`schemalink api-key set sk-...`):
+
+```bash
+pip install "text2cypher-composer[schemalink]"
+```
+
 ## Usage
 
 ```python
@@ -85,6 +91,9 @@ print(result.cypher)
 print(result.prompt)                    # exact messages sent to the model, fully instantiated
 print(result.executed, result.result)   # result.result is None if execution failed
 print(result.validation)                # CyVer report, always populated
+print(result.execution_error)           # native Neo4j error (code + message), or None
+print(result.execution_warnings)        # Neo4j notifications observed during execution, always populated
+print(result.prompt_tokens)             # prompt's tiktoken token count, or None if tiktoken isn't installed
 ```
 
 ### Techniques
@@ -118,6 +127,7 @@ new LLM-driven pruning mode:
 | `"ner_exact_match"`    | Same as `"exact_match"`, but named entities in the question are first masked with their entity type, so entity *values* (e.g. a gene name) don't get confused with schema field names. | `nlp` |
 | `"similarity"`         | Prunes the base schema to labels/types/properties whose word-vector similarity to the question clears `similarity_threshold`. No fallback — an unrelated question can prune to nothing. | `nlp` |
 | `"llm_pruning"`        | Asks `model` itself (via structured/JSON-schema output) which labels and relationship types are relevant. Falls back to the full schema if it selects none (and silently drops any hallucinated label/type not actually in the schema). | — |
+| `"ie_extraction"`      | Runs schema-grounded information extraction (NER + relation extraction) over the question via a user-supplied `ie_engine`, and keeps exactly the entity types/relationship types/properties it found — no substring matching, unlike `"exact_match"`/`"ner_exact_match"`. | `ie_engine` |
 
 `nlp` is a loaded NLP pipeline you bring yourself — this library never
 imports spaCy (or any NLP library) directly, it only calls `nlp(text)` /
@@ -143,13 +153,129 @@ result = run(
 )
 ```
 
-`schema_mode`/`nlp`/`similarity_threshold` are disallowed for techniques
-that don't use the schema (`"vanilla"`, `"RAG"`, `"RAG+O"`) — `run()` raises
-`ValueError` if you pass them there. The available modes are listed by
-`list_schema_modes()`, and the individual pruning functions
+`schema_mode`/`nlp`/`similarity_threshold`/`ie_engine` are disallowed for
+techniques that don't use the schema (`"vanilla"`, `"RAG"`, `"RAG+O"`) —
+`run()` raises `ValueError` if you pass them there. The available modes are
+listed by `list_schema_modes()`, and the individual pruning functions
 (`exact_match_prune`, `ner_exact_match_prune`, `similarity_prune`,
-`llm_prune`, `mask_entities`) are exported standalone too, for pruning a
-schema outside of a full `run()` call.
+`llm_prune`, `ie_prune`, `mask_entities`, `structured_schema_to_linkml`) are
+exported standalone too, for pruning a schema outside of a full `run()`
+call.
+
+### `schema_components` (`"exact_match"`/`"ner_exact_match"`/`"ie_extraction"` only)
+
+By default, these three modes only match/extract **entity types** (node
+labels) against the question — exactly as before. `schema_components` widens
+that to any combination of the four schema element kinds in `SchemaComponent`:
+
+```python
+from text2cypher_composer import SchemaComponent, list_schema_components
+
+list_schema_components()
+# ["entity_types", "relationship_types", "node_properties", "relationship_properties"]
+```
+
+- `"entity_types"` (default): node labels mentioned in the question.
+- `"relationship_types"`: relationship types mentioned in the question — for
+  `"exact_match"`/`"ner_exact_match"`, this additionally keeps a relationship
+  whose *type* (not just its endpoints) is mentioned, instead of only
+  inferring kept relationships from which node labels were selected.
+- `"node_properties"` / `"relationship_properties"`: narrows a selected
+  label's/type's properties down to the ones actually mentioned, instead of
+  keeping every property of a selected label/type (the default). A label/type
+  with no property mentioned keeps all of its properties rather than none —
+  same "don't over-prune" fallback `exact_match_prune` already uses when no
+  label at all is mentioned.
+
+Entity types always anchor the selection for `"exact_match"`/
+`"ner_exact_match"` (their matches decide which node types — and, via shared
+endpoints, which relationships — survive); the other components only narrow
+further what's kept once a label is selected. For `"ie_extraction"`,
+`schema_components` instead controls what's *asked of* the extraction engine
+in the first place (see below).
+
+```python
+result = run(
+    input_NL="...",
+    model="gpt-4o",
+    database={},
+    technique="Schema",
+    schema_mode="exact_match",
+    schema_components=["entity_types", "relationship_types", "node_properties", "relationship_properties"],
+)
+```
+
+### `ie_engine` (`"ie_extraction"` only)
+
+`"ie_extraction"` asks a schema-grounded information-extraction engine —
+rather than a substring-match heuristic — which entities, relations, and
+(if requested via `schema_components`) attributes are present in the
+question, then keeps exactly those. `structured_schema_to_linkml` first
+converts the graph's structured schema into a
+[LinkML](https://linkml.io/) YAML schema (no ontology grounding — just
+classes/attributes named *exactly* like the Neo4j labels/types/properties,
+since `ie_prune` only needs entity/relation/attribute presence, not links to
+external ontology IDs); `ie_engine` is then called as
+`ie_engine(schema_yaml, question)` and must return a dict shaped like
+[SchemaLink](https://github.com/BioDataUniMI/schemalink-engine)'s output —
+`{class_name: {"mentions": [{...}, ...]}}`, one entry per class actually
+asked for (empty/absent `"mentions"` for a class found nowhere in the text):
+
+```python
+result = run(
+    input_NL="...",
+    model="gpt-4o",
+    database={},
+    technique="Schema",
+    schema_mode="ie_extraction",
+    schema_components=["entity_types", "relationship_types"],
+    ie_engine=my_ie_engine,  # callable: (schema_yaml, question) -> dict
+)
+```
+
+**`schemalink_ie_engine()` is a ready-made `ie_engine`** backed by the real
+[SchemaLink](https://github.com/BioDataUniMI/schemalink-engine) package —
+`pip install schemalink-engine` (or
+`pip install "text2cypher-composer[schemalink]"`), then set an OpenAI API key
+for it (`schemalink api-key set sk-...`):
+
+```python
+from text2cypher_composer import schemalink_ie_engine
+
+result = run(
+    input_NL="...",
+    model="gpt-4o",
+    database={},
+    technique="Schema",
+    schema_mode="ie_extraction",
+    schema_components=["entity_types", "relationship_types"],
+    ie_engine=schemalink_ie_engine(),
+)
+```
+
+It bridges `ie_prune`'s `ie_engine(schema_yaml, question) -> dict` contract to
+`schemalink_engine.pipeline.run_extraction_pipeline`, which works over
+schema/text *file paths* and writes its output to a JSON file rather than
+returning it — the adapter writes both to a scratch temp directory (so it
+doesn't litter your cwd with the pipeline's `generated/`/`output/` working
+directories) and reads the output back. It isn't thread-safe (the pipeline
+`chdir`s into that scratch directory for the extraction's duration), so don't
+call it from multiple threads concurrently.
+
+`schemalink_ie_engine(include_node_types=True, include_relationship_types=True,
+include_properties=True, with_dependencies=True, ground_entities=None)` — the
+three booleans mirror `schema_components`'s entity/relationship/property split,
+but coarser (node/relationship properties aren't split) and independent of
+it: they filter the LinkML schema actually sent to SchemaLink on this call,
+on top of whatever `schema_components` already restricted it to upstream —
+e.g. `include_properties=False` still asks which entities/relationships are
+mentioned, just not to also extract their property values. `with_dependencies`
+toggles SchemaLink's dependency-aware extraction (each class's GPT call
+conditioned on its dependencies' results — the default, and SchemaLink's own
+default) vs. flat/independent extraction per class. `ground_entities` (e.g.
+`{"mode": "auto"}`) grounds extracted entities to biomedical ontology IDs via
+OAK — only for classes whose LinkML definition declares `annotators:`, and
+downloads ontology databases on first use.
 
 ### `database`
 
@@ -188,10 +314,17 @@ None of these prefixes overlap (`"gpt-"`/`"o1"`/`"ft:..."` vs. `"claude-"` vs. `
 `rescue_prompt=True` (default `False`) retries a query that fails to execute or comes back
 empty with a second "fix this query" prompt — reusing the same schema/examples context as
 `technique`, plus the bad query and an `error_message`. Ported from the miRNAKG rescue-prompt
-notebook, with one change: `error_message` is built from **CyVer's validation report** (both its
-warning-level notifications and hard errors — `validation.syntax_metadata`/`schema_metadata`/
-`properties_metadata`), which `run()` already computes for every query, rather than from a raw
-Neo4j exception string:
+notebook, and `error_message` concatenates every signal available about the failure, in order:
+
+1. the **native Neo4j error** (code + message) if the query didn't execute at all;
+2. any **Neo4j notifications** observed during execution — deprecated syntax, unknown
+   labels/relationship-types/properties, cartesian products, etc. — captured the same way the
+   notebook's `execute_query_with_warnings` did, by running through the raw driver instead of
+   `Neo4jGraph.query()`;
+3. an `"Empty result set."` note if it executed but returned nothing;
+4. **CyVer's validation report** (`validation.syntax_metadata`/`schema_metadata`/
+   `properties_metadata`, both its warning-level notifications and hard errors), which `run()`
+   already computes for every query.
 
 ```python
 result = run(
@@ -206,12 +339,35 @@ result = run(
 print(result.initial_cypher)              # what the model generated first
 print(result.cypher)                      # the final (possibly rescued) query
 print(result.rescued, result.rescue_attempts)
+print(result.rescue_error_messages)       # the error_message fed to each rescue attempt, in order
+print(result.rescue_prompts)              # the fully-instantiated messages sent for each rescue attempt
+print(result.rescue_prompt_tokens)        # token count of each rescue prompt — a list of rescue_attempts numbers
 ```
 
 Each rescue attempt stops early once one succeeds (executes and returns a non-empty result);
-`max_retries` caps how many are tried before giving up. `result.cypher`/`result.executed`/
-`result.result`/`result.validation` always reflect the *final* attempt; `result.initial_cypher`
-and `result.prompt` (the exact messages sent) always reflect the *first* one.
+`max_retries` caps how many are tried before giving up — it must be `>= 1` (`run()` raises
+`ValueError` for `max_retries=0` or negative). `result.cypher`/`result.executed`/`result.result`/
+`result.validation`/`result.execution_error`/`result.execution_warnings` always reflect the
+*final* attempt; `result.initial_cypher` and `result.prompt` (the exact messages sent) always
+reflect the *first* one.
+
+`result.rescue_error_messages` and `result.rescue_prompts` are parallel lists — one entry per
+rescue attempt (`rescue_prompts[i]` is the exact messages sent for `rescue_error_messages[i]`),
+both empty if `rescued` is `False` — so you can inspect exactly what each fix-up prompt was told
+went wrong, and what it was actually sent.
+
+`result.execution_error`/`result.execution_warnings` — the native Neo4j error (if it didn't
+execute) and any Neo4j notifications observed during execution — are populated for the *final*
+attempt regardless of whether `rescue_prompt` is used at all; they're the same signals
+`rescue_error_messages` is built from (see below), just always available, not only when rescuing.
+
+`result.prompt_tokens` (the initial prompt's `tiktoken` token count) and
+`result.rescue_prompt_tokens` (the parallel per-attempt count for `rescue_prompts` — a list of
+`rescue_attempts` numbers) let you tally exactly how many extra tokens `rescue_prompt` costs on
+top of the initial generation. If `tiktoken` isn't installed
+(`pip install "text2cypher-composer[dataset-tools]"`), each count is `None` instead of raising —
+`rescue_prompt_tokens` is then a list of `None`s the same length as `rescue_attempts`, not an
+empty list (it's only empty when `rescued` is `False`).
 
 ### `dry_run`
 
@@ -230,14 +386,16 @@ preview = run(
     dry_run=True,
 )
 
-print(preview.prompt)   # the exact messages that *would* be sent to the model
-print(preview.cypher)   # None — nothing was generated
+print(preview.prompt)         # the exact messages that *would* be sent to the model
+print(preview.prompt_tokens)  # their tiktoken token count — still computed, no API call needed
+print(preview.cypher)         # None — nothing was generated
 ```
 
 Useful to sanity-check what a given `technique`/`schema_mode`/`dataset` combination would
-actually send the model, without spending an API call (or a database write, for techniques that
-execute) on it. Incompatible with `rescue_prompt=True` — `run()` raises `ValueError` if both are
-passed, since `dry_run` generates nothing to rescue.
+actually send the model — including its token count, so `dry_run=True` alone is enough to compare
+how many tokens different `schema_mode`s cost — without spending an API call (or a database
+write, for techniques that execute) on it. Incompatible with `rescue_prompt=True` — `run()`
+raises `ValueError` if both are passed, since `dry_run` generates nothing to rescue.
 
 ### `dataset` (RAG techniques only)
 
@@ -515,6 +673,8 @@ report = evaluate_technique(
     database={},          # uses NEO4J_* env vars
     technique="Schema",
     k=3,                   # optional, defaults to 1
+    rescue_prompt=True,    # optional, defaults to False — see `run()`'s rescue_prompt
+    max_retries=2,         # optional, defaults to 1
 )
 
 print(report.summary)
@@ -543,11 +703,23 @@ text: since Neo4j doesn't guarantee row order without `ORDER BY`, rows are
 greedily bipartite-matched by similarity before being compared whenever the
 gold query has none.
 
+`evaluate_technique` also forwards `rescue_prompt`/`max_retries` (default `False`/`1`, same as
+`run()`) to every attempt.
+
 Besides the metric/pass@j columns, `report.to_dataframe()` also carries, per question: any
 columns `gold_df` had beyond `question`/`query` (e.g. bio2C's `"ID"`/`"level"`, if you built
-`gold_df` with `load_finetune_levels`), `prompt` (the exact messages sent for the first
-attempt), `gold_data`/`predicted_data` (the gold/generated query's result rows), and
-`retrieved_example_ids`/`retrieved_example_distances` for RAG techniques (`None` otherwise).
+`gold_df` with `load_finetune_levels`), `prompt`/`prompt_tokens` (the exact messages sent for the
+first attempt and their `tiktoken` token count — `None` if `tiktoken` isn't installed; compare it
+across `technique`/`schema_mode` rows to see how many tokens schema filtering saves),
+`gold_data`/`predicted_data` (the gold/generated query's result rows), `execution_error`/
+`execution_warnings` (the native Neo4j error/notifications from the first attempt's actual
+execution, populated regardless of `rescue_prompt`), `rescued`/`rescue_attempts` (whether — and
+how many retries — the first attempt needed to stop failing/coming back empty, when
+`rescue_prompt=True`; `False`/`0` otherwise), `rescue_error_messages`/`rescue_prompts` (the
+`error_message`/fully-instantiated messages sent for each retry) and `rescue_prompt_tokens`
+(their token counts, to tally how many extra tokens `rescue_prompt` costs across the whole gold
+set), and `retrieved_example_ids`/`retrieved_example_distances` for RAG techniques (`None`
+otherwise).
 
 **`save_evaluation_report` persists a report as a `.pkl`/`.xlsx` pair**, one per (model,
 technique) — named `evaluating_text2cypher_{model}_{technique}.{pkl,xlsx}`:

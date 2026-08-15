@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock, patch
+
 import pandas as pd
 import pytest
 
@@ -6,6 +8,7 @@ from text2cypher_composer.evaluation import (
     EvaluationReport,
     EvaluationSummary,
     QuestionEvaluation,
+    evaluate_technique,
     save_evaluation_report,
 )
 
@@ -73,6 +76,61 @@ def test_to_dataframe_includes_extra_prompt_and_data_columns():
     assert row["retrieved_example_distances"] == [0.1, 0.2]
 
 
+def test_to_dataframe_includes_rescue_columns():
+    rescued_result = _fake_result(
+        rescued=True,
+        rescue_attempts=2,
+        rescue_error_messages=["Cypher syntax error: bad", "Empty result set."],
+        rescue_prompts=[
+            [{"role": "human", "content": "fix attempt 1"}],
+            [{"role": "human", "content": "fix attempt 2"}],
+        ],
+        rescue_prompt_tokens=[12, 15],
+        prompt_tokens=8,
+        execution_error=None,
+        execution_warnings=["Warning: deprecated - Position: line 1, column 1"],
+    )
+    details = [_fake_question_evaluation(attempts=[rescued_result])]
+    report = EvaluationReport(
+        summary=EvaluationSummary(
+            technique="Schema+RAG",
+            model="gpt-4o-mini",
+            n_questions=1,
+            k=1,
+            mean_jaro_winkler=1.0,
+            mean_levenshtein=1.0,
+            mean_jaccard=1.0,
+            mean_coverage=1.0,
+            pass_at_k={1: 1.0},
+        ),
+        details=details,
+    )
+
+    row = report.to_dataframe().iloc[0]
+    assert bool(row["rescued"]) is True
+    assert row["rescue_attempts"] == 2
+    assert row["rescue_error_messages"] == ["Cypher syntax error: bad", "Empty result set."]
+    assert row["rescue_prompts"] == [
+        [{"role": "human", "content": "fix attempt 1"}],
+        [{"role": "human", "content": "fix attempt 2"}],
+    ]
+    assert row["rescue_prompt_tokens"] == [12, 15]
+    assert row["prompt_tokens"] == 8
+    assert row["execution_error"] is None
+    assert row["execution_warnings"] == ["Warning: deprecated - Position: line 1, column 1"]
+
+
+def test_to_dataframe_rescue_columns_default_when_not_rescued():
+    row = _fake_report().to_dataframe().iloc[0]
+    assert bool(row["rescued"]) is False
+    assert row["rescue_attempts"] == 0
+    assert row["rescue_error_messages"] == []
+    assert row["rescue_prompts"] == []
+    assert row["rescue_prompt_tokens"] == []
+    assert row["execution_error"] is None
+    assert row["execution_warnings"] == []
+
+
 def test_to_dataframe_retrieved_examples_none_for_non_rag():
     non_rag_result = _fake_result(technique="vanilla", retrieved_examples=None)
     details = [_fake_question_evaluation(attempts=[non_rag_result])]
@@ -94,6 +152,38 @@ def test_to_dataframe_retrieved_examples_none_for_non_rag():
     row = report.to_dataframe().iloc[0]
     assert row["retrieved_example_ids"] is None
     assert row["retrieved_example_distances"] is None
+
+
+def test_evaluate_technique_forwards_rescue_prompt_and_max_retries_to_run():
+    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+
+    with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
+         patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
+         patch("text2cypher_composer.evaluation.run", return_value=_fake_result()) as mock_run:
+        evaluate_technique(
+            df,
+            model="gpt-4o-mini",
+            database={},
+            technique="vanilla",
+            rescue_prompt=True,
+            max_retries=3,
+        )
+
+    mock_run.assert_called_once()
+    assert mock_run.call_args.kwargs["rescue_prompt"] is True
+    assert mock_run.call_args.kwargs["max_retries"] == 3
+
+
+def test_evaluate_technique_defaults_rescue_prompt_to_false():
+    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+
+    with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
+         patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
+         patch("text2cypher_composer.evaluation.run", return_value=_fake_result()) as mock_run:
+        evaluate_technique(df, model="gpt-4o-mini", database={}, technique="vanilla")
+
+    assert mock_run.call_args.kwargs["rescue_prompt"] is False
+    assert mock_run.call_args.kwargs["max_retries"] == 1
 
 
 def test_save_evaluation_report_writes_pkl_and_xlsx(tmp_path):

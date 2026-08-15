@@ -3,11 +3,13 @@
 Ported from the miRNAKG rescue-prompt notebook: when the first generated
 query is invalid (fails to execute) or comes back empty, a second prompt
 — reusing the same schema/examples context as the original generation, plus
-the bad query and an error message — asks the model to fix it. Unlike the
-notebook (which built the error message from raw Neo4j notifications/
-exceptions), `error_message` here is built from CyVer's validation report
-(`validate_cypher`), which `run()` computes for every query already —
-combining both its warning-level notifications and hard errors.
+the bad query and an error message — asks the model to fix it. `error_message`
+concatenates every signal `run()` has about why the query needs rescuing: the
+native Neo4j error (if it failed to execute) and any Neo4j notifications
+(warnings) observed during execution, exactly like the notebook's
+`execute_query_with_warnings`, plus CyVer's validation report
+(`validate_cypher`), which `run()` also computes for every query — combining
+both its warning-level notifications and hard errors.
 """
 from __future__ import annotations
 
@@ -81,10 +83,26 @@ def _format_metadata(label: str, entries: List[Dict[str, str]]) -> str:
 
 
 def build_error_message(
-    executed: bool, result: Optional[List[Dict[str, Any]]], validation: CypherValidationReport
+    executed: bool,
+    result: Optional[List[Dict[str, Any]]],
+    validation: CypherValidationReport,
+    execution_error: Optional[str] = None,
+    execution_warnings: Optional[List[str]] = None,
 ) -> str:
-    """Build a rescue `error_message` from CyVer's validation report (both warnings and errors)."""
+    """Build a rescue `error_message` from every signal available about the failure.
+
+    Concatenates, in order: the native Neo4j error (if the query didn't
+    execute), every Neo4j notification observed during execution (deprecated
+    syntax, unknown labels/relationship-types/properties, cartesian products,
+    ...), an "empty result set" note if it executed but returned nothing, and
+    CyVer's validation report (both its warning-level notifications and hard
+    errors).
+    """
     parts = []
+    if execution_error:
+        parts.append(execution_error)
+    if execution_warnings:
+        parts.extend(execution_warnings)
     if executed and not result:
         parts.append("Empty result set.")
     for label, entries in (

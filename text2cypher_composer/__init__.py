@@ -32,19 +32,24 @@ from .metrics import (
 from .prompts import get_all_prompt_templates, get_prompt_template
 from .rag import RAGDataset
 from .rescue import build_error_message, needs_rescue
+from .schemalink_adapter import schemalink_ie_engine
 from .schema_modes import (
     SchemaSelection,
     exact_match_prune,
+    ie_prune,
     llm_prune,
     mask_entities,
     ner_exact_match_prune,
     similarity_prune,
+    structured_schema_to_linkml,
 )
 from .techniques import (
+    SchemaComponent,
     SchemaMode,
     Technique,
     TechniqueInfo,
     describe_technique,
+    list_schema_components,
     list_schema_modes,
     list_technique_info,
     list_techniques,
@@ -76,11 +81,16 @@ __all__ = [
     "coverage_similarity",
     "SchemaMode",
     "list_schema_modes",
+    "SchemaComponent",
+    "list_schema_components",
     "SchemaSelection",
     "exact_match_prune",
     "ner_exact_match_prune",
     "similarity_prune",
     "llm_prune",
+    "ie_prune",
+    "structured_schema_to_linkml",
+    "schemalink_ie_engine",
     "mask_entities",
     "needs_rescue",
     "build_error_message",

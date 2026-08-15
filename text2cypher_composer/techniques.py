@@ -71,6 +71,11 @@ class SchemaMode(str, Enum):
       user-supplied NLP pipeline with word vectors).
     - "llm_pruning": asks the model itself (via structured/JSON-schema
       output) which labels and relationship types are relevant.
+    - "ie_extraction": runs schema-grounded information extraction (NER +
+      relation extraction) over the question via a user-supplied `ie_engine`,
+      and keeps exactly the entity types/relationship types/properties it
+      found — no substring matching involved, unlike "exact_match"/
+      "ner_exact_match". See `ie_prune`.
     """
 
     SCHEMA = "schema"
@@ -79,6 +84,7 @@ class SchemaMode(str, Enum):
     NER_EXACT_MATCH = "ner_exact_match"
     SIMILARITY = "similarity"
     LLM_PRUNING = "llm_pruning"
+    IE_EXTRACTION = "ie_extraction"
 
 
 SchemaModeLike = Union[str, SchemaMode]
@@ -87,3 +93,38 @@ SchemaModeLike = Union[str, SchemaMode]
 def list_schema_modes() -> List[str]:
     """Return the string values accepted by `run()`'s `schema_mode` argument."""
     return [m.value for m in SchemaMode]
+
+
+class SchemaComponent(str, Enum):
+    """Schema element kinds the filtering modes can match against.
+
+    Meaningful for `schema_mode="exact_match"`/`"ner_exact_match"` (literal
+    substring matching against the question) and `"ie_extraction"`
+    (schema-grounded information extraction) — see `resolve_schema_text`'s
+    `schema_components` argument. For "exact_match"/"ner_exact_match", node/
+    entity types always anchor the selection; the other components only
+    narrow further what's kept once an entity type is selected. For
+    "ie_extraction", `components` instead controls what's *asked of* the
+    extraction engine in the first place (see `structured_schema_to_linkml`).
+
+    - "entity_types" (default): node labels mentioned in the question.
+    - "relationship_types": relationship types mentioned in the question.
+    - "node_properties": node property names mentioned in the question.
+    - "relationship_properties": relationship property names mentioned in
+      the question.
+    """
+
+    ENTITY_TYPES = "entity_types"
+    RELATIONSHIP_TYPES = "relationship_types"
+    NODE_PROPERTIES = "node_properties"
+    RELATIONSHIP_PROPERTIES = "relationship_properties"
+
+
+SchemaComponentLike = Union[str, SchemaComponent]
+
+DEFAULT_SCHEMA_COMPONENTS = frozenset({SchemaComponent.ENTITY_TYPES})
+
+
+def list_schema_components() -> List[str]:
+    """Return the string values accepted by `run()`'s `schema_components` argument."""
+    return [c.value for c in SchemaComponent]
