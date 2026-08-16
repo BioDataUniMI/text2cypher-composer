@@ -1,6 +1,20 @@
-import pytest
+from unittest.mock import MagicMock, patch
 
-from text2cypher_composer.schema_modes import exact_match_prune, mask_entities, ner_exact_match_prune
+import pytest
+from langchain_core.runnables import RunnableLambda
+
+from text2cypher_composer.schema_modes import (
+    SchemaSelection,
+    exact_match_prune,
+    llm_prune,
+    llm_prune_nodes_only,
+    mask_entities,
+    ner_exact_match_prune,
+    resolve_cascade_mode_levels,
+    similarity_prune,
+    similarity_prune_nodes_only,
+)
+from text2cypher_composer.techniques import CascadeModeLevel
 
 STRUCTURED_SCHEMA = {
     "node_props": {
@@ -67,3 +81,138 @@ def test_ner_exact_match_prune_uses_masked_question():
     # confirms masking ran and didn't crash the downstream exact-match pruning.
     pruned = ner_exact_match_prune(STRUCTURED_SCHEMA, "Which genes transcribe MIR21?", _FakeNLP())
     assert "Gene" in pruned["node_props"]
+
+
+SIMILARITY_SCHEMA = {
+    "node_props": {
+        "Gene": [{"property": "symbol", "type": "STRING"}],
+        # "Pathway" only becomes relevant via its "gene" property, not its own label —
+        # exercises the "sneaks in via property match" case similarity_prune_nodes_only excludes.
+        "Pathway": [{"property": "gene", "type": "STRING"}],
+    },
+    "relationships": [{"start": "Gene", "type": "PART_OF", "end": "Pathway"}],
+    "rel_props": {"PART_OF": [{"property": "role", "type": "STRING"}]},
+    "metadata": {},
+}
+
+
+class _FakeToken:
+    """word-vector similarity == exact (lowercased) word match, for testing."""
+
+    def __init__(self, text):
+        self.text = text.lower()
+        self.is_alpha = text.isalpha()
+        self.has_vector = True
+
+    def similarity(self, other):
+        return 1.0 if self.text == other.text else 0.0
+
+
+class _FakeSimilarityNLP:
+    class _Vocab:
+        def __getitem__(self, term):
+            return _FakeToken(term)
+
+    def __init__(self):
+        self.vocab = self._Vocab()
+
+    def __call__(self, text):
+        return [_FakeToken(w) for w in text.split()]
+
+
+def test_similarity_prune_full_lets_a_property_match_sneak_the_node_in():
+    pruned = similarity_prune(SIMILARITY_SCHEMA, "Show me every gene entry", _FakeSimilarityNLP())
+    # "Pathway" has no matching label, but its "gene" property does — so it's kept
+    assert set(pruned["node_props"]) == {"Gene", "Pathway"}
+    # the PART_OF relationship is kept via its *start* endpoint ("Gene") alone
+    assert pruned["relationships"] == [{"start": "Gene", "type": "PART_OF", "end": "Pathway"}]
+
+
+def test_similarity_prune_nodes_only_requires_the_label_itself_to_match():
+    pruned = similarity_prune_nodes_only(SIMILARITY_SCHEMA, "Show me every gene entry", _FakeSimilarityNLP())
+    # "Pathway"'s label doesn't match "gene" — property-only matches don't count here
+    assert set(pruned["node_props"]) == {"Gene"}
+    assert pruned["node_props"]["Gene"] == SIMILARITY_SCHEMA["node_props"]["Gene"]  # full properties kept
+    # both endpoints must be selected labels — Pathway isn't, so the relationship is dropped
+    assert pruned["relationships"] == []
+    assert pruned["rel_props"] == {}
+
+
+def test_similarity_prune_nodes_only_falls_back_to_full_schema_when_nothing_matches():
+    pruned = similarity_prune_nodes_only(SIMILARITY_SCHEMA, "What's the weather today?", _FakeSimilarityNLP())
+    assert pruned == SIMILARITY_SCHEMA
+
+
+class _FakeStructuredOutputLLM:
+    """Stands in for a chat model's `.with_structured_output(...)`, returning a fixed selection."""
+
+    def __init__(self, selection: SchemaSelection):
+        self._selection = selection
+
+    def with_structured_output(self, schema, method=None):
+        return RunnableLambda(lambda _inputs: self._selection)
+
+
+def test_llm_prune_uses_relationship_types_directly():
+    selection = SchemaSelection(node_labels=["Gene"], relationship_types=["PART_OF"])
+    pruned = llm_prune(SIMILARITY_SCHEMA, "irrelevant text", _FakeStructuredOutputLLM(selection))
+    # PART_OF is explicitly selected, so it's kept even though "Pathway" isn't
+    assert pruned["relationships"] == [{"start": "Gene", "type": "PART_OF", "end": "Pathway"}]
+
+
+def test_llm_prune_nodes_only_ignores_relationship_types():
+    selection = SchemaSelection(node_labels=["Gene"], relationship_types=["PART_OF"])
+    pruned = llm_prune_nodes_only(SIMILARITY_SCHEMA, "irrelevant text", _FakeStructuredOutputLLM(selection))
+    assert set(pruned["node_props"]) == {"Gene"}
+    # relationship_types is discarded — Pathway isn't a selected label, so PART_OF is dropped
+    assert pruned["relationships"] == []
+
+
+def test_resolve_cascade_mode_levels_exact_match_three_rungs_in_order():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.get_schema", return_value="FULL SCHEMA TEXT"):
+        levels = resolve_cascade_mode_levels(
+            MagicMock(), "exact_match", "Which miRNAs are over expressed in cancer?"
+        )
+
+    assert [level for level, _ in levels] == [
+        CascadeModeLevel.NARROW,
+        CascadeModeLevel.NODES_ONLY,
+        CascadeModeLevel.FULL,
+    ]
+    narrow_text, nodes_only_text, full_text = (text for _, text in levels)
+    assert "miRNA" in narrow_text and "Cancer" in narrow_text
+    assert "miRNA" in nodes_only_text and "Cancer" in nodes_only_text
+    assert full_text == "FULL SCHEMA TEXT"
+
+
+def test_resolve_cascade_mode_levels_skip_narrow_only_has_two_rungs():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.get_schema", return_value="FULL SCHEMA TEXT"):
+        levels = resolve_cascade_mode_levels(
+            MagicMock(), "exact_match", "Which miRNAs are over expressed in cancer?", skip_narrow=True
+        )
+
+    assert [level for level, _ in levels] == [CascadeModeLevel.NODES_ONLY, CascadeModeLevel.FULL]
+
+
+def test_resolve_cascade_mode_levels_rejects_non_pruning_modes():
+    with pytest.raises(ValueError, match="nothing to prune"):
+        resolve_cascade_mode_levels(MagicMock(), "schema", "some question")
+    with pytest.raises(ValueError, match="nothing to prune"):
+        resolve_cascade_mode_levels(MagicMock(), "enhanced", "some question")
+
+
+def test_resolve_cascade_mode_levels_requires_nlp_for_similarity():
+    with pytest.raises(ValueError, match="nlp"):
+        resolve_cascade_mode_levels(MagicMock(), "similarity", "some question")
+
+
+def test_resolve_cascade_mode_levels_requires_llm_for_llm_pruning():
+    with pytest.raises(ValueError, match="llm_pruning"):
+        resolve_cascade_mode_levels(MagicMock(), "llm_pruning", "some question")
+
+
+def test_resolve_cascade_mode_levels_requires_ie_engine_for_ie_extraction():
+    with pytest.raises(ValueError, match="ie_engine"):
+        resolve_cascade_mode_levels(MagicMock(), "ie_extraction", "some question")

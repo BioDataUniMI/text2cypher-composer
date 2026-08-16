@@ -158,9 +158,10 @@ techniques that don't use the schema (`"vanilla"`, `"RAG"`, `"RAG+O"`) —
 `run()` raises `ValueError` if you pass them there. The available modes are
 listed by `list_schema_modes()`, and the individual pruning functions
 (`exact_match_prune`, `ner_exact_match_prune`, `similarity_prune`,
-`llm_prune`, `ie_prune`, `mask_entities`, `structured_schema_to_linkml`) are
-exported standalone too, for pruning a schema outside of a full `run()`
-call.
+`similarity_prune_nodes_only`, `llm_prune`, `llm_prune_nodes_only`,
+`ie_prune`, `mask_entities`, `structured_schema_to_linkml`) are exported
+standalone too, for pruning a schema outside of a full `run()` call — see
+`cascade_mode` below for the nodes-only variants' purpose.
 
 ### `schema_components` (`"exact_match"`/`"ner_exact_match"`/`"ie_extraction"` only)
 
@@ -277,6 +278,57 @@ default) vs. flat/independent extraction per class. `ground_entities` (e.g.
 OAK — only for classes whose LinkML definition declares `annotators:`, and
 downloads ontology databases on first use.
 
+### `cascade_mode` / `skip_narrow_schema_filter` (pruning `schema_mode`s only)
+
+Schema pruning can over-prune: too little schema in the prompt, and the model can't write a
+correct query at all. `cascade_mode=True` (default `False`) retries the *whole* generation —
+a fresh prompt, not `rescue_prompt`'s error-aware fix-up — with progressively less aggressive
+pruning whenever an attempt fails to execute or comes back empty, stopping early once one
+succeeds:
+
+1. **`"narrow"`**: node labels, relationship types, *and* properties all narrowed to the question
+   — `ALL_SCHEMA_COMPONENTS` for `"exact_match"`/`"ner_exact_match"`/`"ie_extraction"`; each
+   mode's normal (most aggressive) pruning for `"similarity"`/`"llm_pruning"`. Skipped entirely
+   if `skip_narrow_schema_filter=True`.
+2. **`"nodes_only"`**: only node labels are matched — `DEFAULT_SCHEMA_COMPONENTS` for
+   `"exact_match"`/`"ner_exact_match"`/`"ie_extraction"`; the new `similarity_prune_nodes_only`/
+   `llm_prune_nodes_only` for `"similarity"`/`"llm_pruning"`. Relationships are kept when both
+   endpoints are among the selected labels, and every property of a selected label/type is kept.
+3. **`"full"`**: the unpruned schema — the final fallback, always tried last.
+
+```python
+result = run(
+    input_NL="...",
+    model="gpt-4o",
+    database={},
+    technique="Schema",
+    schema_mode="exact_match",
+    cascade_mode=True,
+    # skip_narrow_schema_filter=True,  # start straight at "nodes_only" instead of "narrow"
+)
+
+print(result.cascade_mode_level)          # "narrow" / "nodes_only" / "full" — which one was used
+print(result.cascade_mode_attempts)       # how many levels were tried (1..3)
+print(result.cascade_mode_prompts)        # the fully-instantiated prompt tried at each level
+print(result.cascade_mode_prompt_tokens)  # their token counts, parallel to cascade_mode_prompts
+```
+
+`result.cypher`/`result.executed`/`result.result`/`result.validation`/`result.schema`/
+`result.prompt` always reflect the level that was ultimately returned (the first one that
+succeeded, or `"full"` if none did) — same as `rescue_prompt`'s existing "reflects the final
+attempt" convention.
+
+**`cascade_mode` and `rescue_prompt`/`max_retries` are mutually exclusive** — two different retry
+strategies for the same problem (a failing/empty query), not meant to be stacked. `run()` raises
+`ValueError` if `cascade_mode=True` is combined with `rescue_prompt=True` or a non-default
+`max_retries`; pick one.
+
+Only meaningful for a pruning `schema_mode` (`"exact_match"`, `"ner_exact_match"`, `"similarity"`,
+`"llm_pruning"`, `"ie_extraction"`) — `"schema"`/`"enhanced"` have nothing to prune from, and
+`run()` raises `ValueError` if combined with `cascade_mode=True`, same as it does for
+`skip_narrow_schema_filter=True` without `cascade_mode=True`, or `cascade_mode=True` with
+`dry_run=True` (there's nothing generated yet to fail/fall back from).
+
 ### `database`
 
 Either a `langchain_community.graphs.Neo4jGraph` instance, or a dict with
@@ -317,14 +369,16 @@ empty with a second "fix this query" prompt — reusing the same schema/examples
 notebook, and `error_message` concatenates every signal available about the failure, in order:
 
 1. the **native Neo4j error** (code + message) if the query didn't execute at all;
-2. any **Neo4j notifications** observed during execution — deprecated syntax, unknown
-   labels/relationship-types/properties, cartesian products, etc. — captured the same way the
-   notebook's `execute_query_with_warnings` did, by running through the raw driver instead of
-   `Neo4jGraph.query()`;
-3. an `"Empty result set."` note if it executed but returned nothing;
-4. **CyVer's validation report** (`validation.syntax_metadata`/`schema_metadata`/
+2. an `"Empty result set."` note if it executed but returned nothing;
+3. **CyVer's validation report** (`validation.syntax_metadata`/`schema_metadata`/
    `properties_metadata`, both its warning-level notifications and hard errors), which `run()`
    already computes for every query.
+
+Raw Neo4j notifications (deprecated syntax, unknown labels/relationship-types/properties,
+cartesian products, etc. — still captured separately on `result.execution_warnings`, see below)
+are deliberately left out of `error_message` to save tokens: CyVer's schema/properties validators
+already surface the notification codes that matter for a fix-up (unknown labels, relationship
+types, property keys), so including both would just duplicate them in the prompt.
 
 ```python
 result = run(

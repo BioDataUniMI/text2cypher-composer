@@ -18,7 +18,7 @@ def _validation(syntax_valid=True):
     )
 
 
-def test_rescue_error_messages_concatenates_native_error_and_notifications_then_succeeds():
+def test_rescue_error_messages_uses_native_error_then_succeeds():
     call_count = {"n": 0}
 
     def flaky_then_fixed(_):
@@ -49,7 +49,9 @@ def test_rescue_error_messages_concatenates_native_error_and_notifications_then_
     assert len(result.rescue_error_messages) == 1
     msg = result.rescue_error_messages[0]
     assert "Cypher semantic error: Variable `x` not defined" in msg
-    assert "Warning: deprecated - Position: line 1, column 1" in msg
+    # raw Neo4j notifications are deliberately left out of the rescue prompt
+    # (CyVer's validators already surface the schema/property ones)
+    assert "Warning: deprecated - Position: line 1, column 1" not in msg
     assert result.cypher == "MATCH (n:Fixed) RETURN n"
     assert result.initial_cypher == "MATCH (n:Broken) RETURN n"
 

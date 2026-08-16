@@ -5,11 +5,13 @@ query is invalid (fails to execute) or comes back empty, a second prompt
 — reusing the same schema/examples context as the original generation, plus
 the bad query and an error message — asks the model to fix it. `error_message`
 concatenates every signal `run()` has about why the query needs rescuing: the
-native Neo4j error (if it failed to execute) and any Neo4j notifications
-(warnings) observed during execution, exactly like the notebook's
-`execute_query_with_warnings`, plus CyVer's validation report
+native Neo4j error (if it failed to execute), plus CyVer's validation report
 (`validate_cypher`), which `run()` also computes for every query — combining
-both its warning-level notifications and hard errors.
+both its warning-level notifications and hard errors. Raw Neo4j notifications
+(from `execute_query_with_warnings`) are deliberately left out here to save
+tokens: CyVer's schema/properties validators already surface the Neo4j
+notification codes that matter for a fix-up (unknown labels, relationship
+types, property keys), so including both would just duplicate them.
 """
 from __future__ import annotations
 
@@ -87,22 +89,20 @@ def build_error_message(
     result: Optional[List[Dict[str, Any]]],
     validation: CypherValidationReport,
     execution_error: Optional[str] = None,
-    execution_warnings: Optional[List[str]] = None,
 ) -> str:
     """Build a rescue `error_message` from every signal available about the failure.
 
     Concatenates, in order: the native Neo4j error (if the query didn't
-    execute), every Neo4j notification observed during execution (deprecated
-    syntax, unknown labels/relationship-types/properties, cartesian products,
-    ...), an "empty result set" note if it executed but returned nothing, and
-    CyVer's validation report (both its warning-level notifications and hard
-    errors).
+    execute), an "empty result set" note if it executed but returned nothing,
+    and CyVer's validation report (both its warning-level notifications and
+    hard errors). Raw Neo4j notifications are left out: CyVer's schema/
+    properties validators already report the ones that matter (unknown
+    labels/relationship-types/property-keys), so repeating them here would
+    just spend tokens on duplicate information.
     """
     parts = []
     if execution_error:
         parts.append(execution_error)
-    if execution_warnings:
-        parts.extend(execution_warnings)
     if executed and not result:
         parts.append("Empty result set.")
     for label, entries in (

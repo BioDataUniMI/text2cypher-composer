@@ -12,7 +12,7 @@ from .llm import ModelLike, resolve_model, resolve_pruning_model
 from .prompts import messages_for
 from .rag import RAGDataset
 from .rescue import build_error_message, needs_rescue, rescue_messages
-from .schema_modes import resolve_schema_text
+from .schema_modes import resolve_cascade_mode_levels, resolve_schema_text
 from .tokens import count_message_tokens
 from .techniques import (
     DEFAULT_SCHEMA_COMPONENTS,
@@ -51,13 +51,15 @@ class Text2CypherResult:
     succeeded or not, and independently of `rescue_prompt`.
 
     `rescue_error_messages` holds, in order, the `error_message` fed to each
-    rescue attempt — the native Neo4j error, any execution warnings, and
-    CyVer's validation report, concatenated (see `rescue.build_error_message`)
-    — empty if `rescued` is False. `rescue_prompts` holds, in the same
-    order, the exact fully-instantiated messages sent to the model for each
-    rescue attempt (`rescue_prompts[i]` produced `cypher` from
-    `error_message` `rescue_error_messages[i]`) — also empty if `rescued` is
-    False.
+    rescue attempt — the native Neo4j error, an "Empty result set." note,
+    and CyVer's validation report, concatenated (see
+    `rescue.build_error_message`) — empty if `rescued` is False.
+    `rescue_prompts` holds, in the same order, the exact fully-instantiated
+    messages sent to the model for each rescue attempt (`rescue_prompts[i]`
+    produced `cypher` from `error_message` `rescue_error_messages[i]`) —
+    also empty if `rescued` is False. `cascade_mode` and `rescue_prompt` are
+    mutually exclusive (see `run()`), so these are always empty when
+    `cascade_mode` was used.
 
     `prompt_tokens` is `prompt`'s token count (via `tiktoken`, `None` if it
     isn't installed) — handy for comparing prompt size across `technique`/
@@ -66,6 +68,16 @@ class Text2CypherResult:
     `rescue_prompts` — always a list of `rescue_attempts` numbers when
     rescued (handy for tallying how many extra tokens `rescue_prompt` costs),
     empty otherwise.
+
+    `cascade_mode_level` is which rung of the `cascade_mode` cascade
+    (see `run()`) the returned `cypher`/`result`/etc. came from — `"narrow"`,
+    `"nodes_only"`, or `"full"` — `None` if `cascade_mode` wasn't used.
+    `cascade_mode_attempts` is how many rungs were tried (1 if the first
+    one tried already succeeded, up to 3). `cascade_mode_prompts`/
+    `cascade_mode_prompt_tokens` hold, one entry per rung tried (in the
+    same order, from most to least pruned), that rung's initial
+    fully-instantiated prompt and its token count — both empty if
+    `cascade_mode` wasn't used.
     """
 
     question: str
@@ -88,6 +100,10 @@ class Text2CypherResult:
     validation: Optional[CypherValidationReport] = None
     schema: Optional[str] = None
     retrieved_examples: Optional[Dict[str, Any]] = None
+    cascade_mode_level: Optional[str] = None
+    cascade_mode_attempts: int = 0
+    cascade_mode_prompts: List[List[Dict[str, str]]] = field(default_factory=list)
+    cascade_mode_prompt_tokens: List[Optional[int]] = field(default_factory=list)
 
 
 def _resolve_dataset(dataset: DatasetLike) -> RAGDataset:
@@ -98,6 +114,114 @@ def _resolve_dataset(dataset: DatasetLike) -> RAGDataset:
     raise TypeError(
         "`dataset` must be a RAGDataset instance or a path to a bio2C-style "
         "benchmark root (containing chroma_db/, CypherQueries/, Neo4jOutputs/)."
+    )
+
+
+@dataclass
+class _AttemptResult:
+    """One full generation attempt: initial prompt, optionally followed by `rescue_prompt` retries.
+
+    Everything `run()` needs from a single (schema-level, in the
+    `cascade_mode` case) attempt to populate `Text2CypherResult` — factored
+    out so the cascade loop and the non-cascade path share the exact same
+    generate/execute/validate/rescue logic instead of duplicating it.
+    """
+
+    cypher: str
+    initial_cypher: str
+    prompt_messages: List[Dict[str, str]]
+    prompt_tokens: Optional[int]
+    executed: bool
+    result: Optional[List[Dict[str, Any]]]
+    validation: CypherValidationReport
+    execution_error: Optional[str]
+    execution_warnings: List[str]
+    rescue_attempts: int
+    rescue_error_messages: List[str]
+    rescue_prompts: List[List[Dict[str, str]]]
+    rescue_prompt_tokens: List[Optional[int]]
+
+
+def _generate_execute_and_rescue(
+    llm: Any,
+    prompt_template: ChatPromptTemplate,
+    format_kwargs: Dict[str, Any],
+    model_name: str,
+    graph: Any,
+    uses_schema: bool,
+    uses_rag: bool,
+    rescue_prompt: bool,
+    max_retries: int,
+) -> _AttemptResult:
+    """Generate a Cypher query from `format_kwargs`, run it, and rescue it if asked to."""
+    formatted_messages = prompt_template.format_messages(**format_kwargs)
+    prompt_messages = [{"role": m.type, "content": m.content} for m in formatted_messages]
+    prompt_tokens = count_message_tokens(prompt_messages, model_name)
+
+    chain = prompt_template | llm | StrOutputParser()
+    cypher = normalize_generated_cypher(chain.invoke(format_kwargs))
+    initial_cypher = cypher
+
+    validation = validate_cypher(graph, cypher)
+    execution_error: Optional[str] = None
+    execution_warnings: List[str] = []
+    try:
+        result, execution_warnings = execute_cypher_with_warnings(graph, cypher)
+        executed = True
+    except CypherExecutionError as e:
+        result = None
+        executed = False
+        execution_error = f"{e.code}: {e.message}"
+        execution_warnings = e.warnings
+
+    rescue_attempts = 0
+    rescue_error_messages: List[str] = []
+    rescue_prompts: List[List[Dict[str, str]]] = []
+    rescue_prompt_tokens: List[Optional[int]] = []
+    if rescue_prompt and needs_rescue(executed, result, validation):
+        rescue_prompt_template = ChatPromptTemplate.from_messages(rescue_messages(uses_schema, uses_rag))
+        rescue_generation = llm | StrOutputParser()
+        for _ in range(max_retries):
+            rescue_attempts += 1
+            error_message = build_error_message(executed, result, validation, execution_error)
+            rescue_error_messages.append(error_message)
+            rescue_kwargs = {
+                **format_kwargs,
+                "query": cypher,
+                "error_message": error_message,
+            }
+            formatted_rescue_messages = rescue_prompt_template.format_messages(**rescue_kwargs)
+            rescue_prompt_dicts = [{"role": m.type, "content": m.content} for m in formatted_rescue_messages]
+            rescue_prompts.append(rescue_prompt_dicts)
+            rescue_prompt_tokens.append(count_message_tokens(rescue_prompt_dicts, model_name))
+            cypher = normalize_generated_cypher(rescue_generation.invoke(formatted_rescue_messages))
+            validation = validate_cypher(graph, cypher)
+            try:
+                result, execution_warnings = execute_cypher_with_warnings(graph, cypher)
+                executed = True
+                execution_error = None
+            except CypherExecutionError as e:
+                result = None
+                executed = False
+                execution_error = f"{e.code}: {e.message}"
+                execution_warnings = e.warnings
+            if not needs_rescue(executed, result, validation):
+                break
+
+    return _AttemptResult(
+        cypher=cypher,
+        initial_cypher=initial_cypher,
+        prompt_messages=prompt_messages,
+        prompt_tokens=prompt_tokens,
+        executed=executed,
+        result=result,
+        validation=validation,
+        execution_error=execution_error,
+        execution_warnings=execution_warnings,
+        rescue_attempts=rescue_attempts,
+        rescue_error_messages=rescue_error_messages,
+        rescue_prompts=rescue_prompts,
+        rescue_prompt_tokens=rescue_prompt_tokens,
     )
 
 
@@ -114,6 +238,8 @@ def run(
     ie_engine: Optional[Any] = None,
     rescue_prompt: bool = False,
     max_retries: int = 1,
+    cascade_mode: bool = False,
+    skip_narrow_schema_filter: bool = False,
     dry_run: bool = False,
 ) -> Text2CypherResult:
     """Translate a natural-language question into Cypher and run it.
@@ -161,25 +287,47 @@ def run(
             empty is retried with a second "fix this query" prompt — reusing
             the same schema/examples context as `technique`, plus the bad
             query and an error message concatenating the native Neo4j error
-            (if it didn't execute), any Neo4j notifications observed during
-            execution, an "Empty result set." note if it executed but
-            returned nothing, and CyVer's validation report (both its
-            warning-level notifications and hard errors) — see
+            (if it didn't execute), an "Empty result set." note if it
+            executed but returned nothing, and CyVer's validation report
+            (both its warning-level notifications and hard errors) — see
             `rescue.build_error_message`, `result.rescue_error_messages`, and
             `result.rescue_prompts` (the fully-instantiated messages sent for
             each rescue attempt).
         max_retries: how many rescue attempts to make (stopping early once
             one succeeds) before giving up. Only relevant when
             `rescue_prompt` is True.
+        cascade_mode: if True, an attempt that fails to execute or comes
+            back empty is retried from scratch (a fresh prompt, not
+            `rescue_prompt`'s error-aware fix-up) with progressively less
+            aggressive schema pruning: first the most aggressively pruned
+            schema ("narrow" — node labels, relationship types, and
+            properties all narrowed to the question), then a less aggressive
+            fallback ("nodes_only" — only node labels matched; relationships
+            kept via shared endpoints, every property of a selected label/
+            type kept), then finally the unpruned schema ("full"). Stops
+            early once one rung succeeds. Mutually exclusive with
+            `rescue_prompt`/`max_retries` — `run()` raises `ValueError` if
+            `cascade_mode=True` is combined with `rescue_prompt=True` or a
+            non-default `max_retries`; pick one retry strategy or the other,
+            not both. Only meaningful — and only allowed — for a pruning
+            `schema_mode` ("exact_match", "ner_exact_match", "similarity",
+            "llm_pruning", or "ie_extraction"); "schema"/"enhanced" have
+            nothing to prune from. See `result.cascade_mode_level`,
+            `result.cascade_mode_attempts`, `result.cascade_mode_prompts`,
+            and `result.cascade_mode_prompt_tokens`.
+        skip_narrow_schema_filter: if True, skip the "narrow" rung and start
+            the `cascade_mode` cascade directly at "nodes_only". Requires
+            `cascade_mode=True`.
         dry_run: if True, build and return the fully-instantiated `prompt`
             (schema resolved, RAG examples retrieved, exactly as it would be
             for a real call) but stop there — no generation call, no Cypher
             execution, no CyVer validation, no rescue. `cypher`,
             `initial_cypher`, `result`, and `validation` are all `None`, and
-            `executed` is `False`. Incompatible with `rescue_prompt=True`
-            (there's nothing generated to rescue). `prompt_tokens` is still
-            computed, so `dry_run` is enough to compare prompt token counts
-            across `technique`/`schema_mode` without spending a generation call.
+            `executed` is `False`. Incompatible with `rescue_prompt=True` or
+            `cascade_mode=True` (there's nothing generated to rescue/fall
+            back from). `prompt_tokens` is still computed, so `dry_run` is
+            enough to compare prompt token counts across `technique`/
+            `schema_mode` without spending a generation call.
 
     Returns:
         A Text2CypherResult. `prompt` holds the fully-instantiated messages
@@ -197,9 +345,15 @@ def run(
         `rescued` is False. `prompt_tokens`/`rescue_prompt_tokens` are their
         `tiktoken` token counts (`None` if `tiktoken` isn't installed) —
         `rescue_prompt_tokens` is a list of `rescue_attempts` numbers,
-        parallel to `rescue_prompts`. If `dry_run` is True, only `prompt`
-        (`prompt_tokens`, and `schema`/`retrieved_examples`, if applicable)
-        are populated.
+        parallel to `rescue_prompts`. If `cascade_mode` was used,
+        `cascade_mode_level` says which rung ("narrow"/"nodes_only"/
+        "full") the rest of the result reflects, `cascade_mode_attempts`
+        how many rungs were tried, and `cascade_mode_prompts`/
+        `cascade_mode_prompt_tokens` list, one per rung tried, that
+        rung's initial prompt/token count — all default to `None`/`0`/`[]`
+        if `cascade_mode` wasn't used. If `dry_run` is True, only
+        `prompt` (`prompt_tokens`, and `schema`/`retrieved_examples`, if
+        applicable) are populated.
     """
     technique = Technique(technique)
     uses_rag = technique in RAG_TECHNIQUES
@@ -218,29 +372,69 @@ def run(
         raise ValueError("`max_retries` must be >= 1.")
     if dry_run and rescue_prompt:
         raise ValueError("`dry_run` and `rescue_prompt` are incompatible: dry_run generates nothing to rescue.")
+    if cascade_mode and not uses_schema:
+        raise ValueError(f"`cascade_mode` requires technique='{technique.value}' to use the schema.")
+    if skip_narrow_schema_filter and not cascade_mode:
+        raise ValueError("`skip_narrow_schema_filter` requires `cascade_mode=True`.")
+    if dry_run and cascade_mode:
+        raise ValueError(
+            "`dry_run` and `cascade_mode` are incompatible: dry_run generates nothing to fall back from."
+        )
+    if cascade_mode and rescue_prompt:
+        raise ValueError(
+            "`cascade_mode` and `rescue_prompt` are mutually exclusive: pick one retry strategy, not both."
+        )
+    if cascade_mode and max_retries != 1:
+        raise ValueError(
+            "`cascade_mode` and `max_retries` are mutually exclusive (max_retries only applies to "
+            "rescue_prompt): pick one retry strategy, not both."
+        )
+    if cascade_mode and SchemaMode(schema_mode if schema_mode is not None else SchemaMode.SCHEMA) in (
+        SchemaMode.SCHEMA,
+        SchemaMode.ENHANCED,
+    ):
+        raise ValueError(
+            "`cascade_mode` requires a pruning `schema_mode` (exact_match, ner_exact_match, "
+            "similarity, llm_pruning, or ie_extraction) — 'schema'/'enhanced' have nothing to "
+            "prune from."
+        )
 
     graph = resolve_database(database)
     llm = resolve_model(model)
     model_name = model if isinstance(model, str) else type(model).__name__
 
     schema_text = None
+    schema_levels = None
     if uses_schema:
         resolved_mode = SchemaMode(schema_mode) if schema_mode is not None else SchemaMode.SCHEMA
         pruning_llm = resolve_pruning_model(model) if resolved_mode == SchemaMode.LLM_PRUNING else None
-        schema_text = resolve_schema_text(
-            graph,
-            resolved_mode,
-            input_NL,
-            llm=pruning_llm,
-            nlp=nlp,
-            similarity_threshold=similarity_threshold,
-            schema_components=schema_components,
-            ie_engine=ie_engine,
-        )
+        if cascade_mode:
+            schema_levels = resolve_cascade_mode_levels(
+                graph,
+                resolved_mode,
+                input_NL,
+                llm=pruning_llm,
+                nlp=nlp,
+                similarity_threshold=similarity_threshold,
+                ie_engine=ie_engine,
+                skip_narrow=skip_narrow_schema_filter,
+            )
+            schema_text = schema_levels[0][1]
+        else:
+            schema_text = resolve_schema_text(
+                graph,
+                resolved_mode,
+                input_NL,
+                llm=pruning_llm,
+                nlp=nlp,
+                similarity_threshold=similarity_threshold,
+                schema_components=schema_components,
+                ie_engine=ie_engine,
+            )
 
     retrieved = None
     format_kwargs: Dict[str, Any] = {"question": input_NL}
-    if uses_schema:
+    if uses_schema and not cascade_mode:
         format_kwargs["enhanced_schema"] = schema_text
     if uses_rag:
         rag_dataset = _resolve_dataset(dataset)
@@ -249,11 +443,11 @@ def run(
         format_kwargs["examples"] = retrieved["examples_text"]
 
     prompt_template = ChatPromptTemplate.from_messages(messages_for(technique))
-    formatted_messages = prompt_template.format_messages(**format_kwargs)
-    prompt_messages = [{"role": m.type, "content": m.content} for m in formatted_messages]
-    prompt_tokens = count_message_tokens(prompt_messages, model_name)
 
     if dry_run:
+        formatted_messages = prompt_template.format_messages(**format_kwargs)
+        prompt_messages = [{"role": m.type, "content": m.content} for m in formatted_messages]
+        prompt_tokens = count_message_tokens(prompt_messages, model_name)
         return Text2CypherResult(
             question=input_NL,
             technique=technique.value,
@@ -268,74 +462,53 @@ def run(
             retrieved_examples=retrieved,
         )
 
-    chain = prompt_template | llm | StrOutputParser()
-    cypher = normalize_generated_cypher(chain.invoke(format_kwargs))
-    initial_cypher = cypher
+    cascade_mode_level: Optional[str] = None
+    cascade_mode_prompts: List[List[Dict[str, str]]] = []
+    cascade_mode_prompt_tokens: List[Optional[int]] = []
 
-    validation = validate_cypher(graph, cypher)
-    execution_error: Optional[str] = None
-    execution_warnings: List[str] = []
-    try:
-        result, execution_warnings = execute_cypher_with_warnings(graph, cypher)
-        executed = True
-    except CypherExecutionError as e:
-        result = None
-        executed = False
-        execution_error = f"{e.code}: {e.message}"
-        execution_warnings = e.warnings
-
-    rescue_attempts = 0
-    rescue_error_messages: List[str] = []
-    rescue_prompts: List[List[Dict[str, str]]] = []
-    rescue_prompt_tokens: List[Optional[int]] = []
-    if rescue_prompt and needs_rescue(executed, result, validation):
-        rescue_prompt_template = ChatPromptTemplate.from_messages(rescue_messages(uses_schema, uses_rag))
-        rescue_generation = llm | StrOutputParser()
-        for _ in range(max_retries):
-            rescue_attempts += 1
-            error_message = build_error_message(executed, result, validation, execution_error, execution_warnings)
-            rescue_error_messages.append(error_message)
-            rescue_kwargs = {
-                **format_kwargs,
-                "query": cypher,
-                "error_message": error_message,
-            }
-            formatted_rescue_messages = rescue_prompt_template.format_messages(**rescue_kwargs)
-            rescue_prompt_dicts = [{"role": m.type, "content": m.content} for m in formatted_rescue_messages]
-            rescue_prompts.append(rescue_prompt_dicts)
-            rescue_prompt_tokens.append(count_message_tokens(rescue_prompt_dicts, model_name))
-            cypher = normalize_generated_cypher(rescue_generation.invoke(formatted_rescue_messages))
-            validation = validate_cypher(graph, cypher)
-            try:
-                result, execution_warnings = execute_cypher_with_warnings(graph, cypher)
-                executed = True
-                execution_error = None
-            except CypherExecutionError as e:
-                result = None
-                executed = False
-                execution_error = f"{e.code}: {e.message}"
-                execution_warnings = e.warnings
-            if not needs_rescue(executed, result, validation):
+    if not cascade_mode:
+        attempt = _generate_execute_and_rescue(
+            llm, prompt_template, format_kwargs, model_name, graph, uses_schema, uses_rag, rescue_prompt, max_retries
+        )
+    else:
+        # cascade_mode and rescue_prompt are mutually exclusive (validated above), so every
+        # rung here is a single clean attempt, never followed by an error-aware fix-up retry.
+        for i, (level, level_schema_text) in enumerate(schema_levels):
+            level_kwargs = {**format_kwargs, "enhanced_schema": level_schema_text}
+            attempt = _generate_execute_and_rescue(
+                llm, prompt_template, level_kwargs, model_name, graph, uses_schema, uses_rag,
+                rescue_prompt=False, max_retries=1,
+            )
+            cascade_mode_prompts.append(attempt.prompt_messages)
+            cascade_mode_prompt_tokens.append(attempt.prompt_tokens)
+            cascade_mode_level = level.value
+            schema_text = level_schema_text
+            is_last = i == len(schema_levels) - 1
+            if is_last or not needs_rescue(attempt.executed, attempt.result, attempt.validation):
                 break
 
     return Text2CypherResult(
         question=input_NL,
         technique=technique.value,
         model=model_name,
-        cypher=cypher,
-        initial_cypher=initial_cypher,
-        prompt=prompt_messages,
-        executed=executed,
-        rescued=rescue_attempts > 0,
-        rescue_attempts=rescue_attempts,
-        rescue_error_messages=rescue_error_messages,
-        rescue_prompts=rescue_prompts,
-        prompt_tokens=prompt_tokens,
-        rescue_prompt_tokens=rescue_prompt_tokens,
-        execution_error=execution_error,
-        execution_warnings=execution_warnings,
-        result=result,
-        validation=validation,
+        cypher=attempt.cypher,
+        initial_cypher=attempt.initial_cypher,
+        prompt=attempt.prompt_messages,
+        executed=attempt.executed,
+        rescued=attempt.rescue_attempts > 0,
+        rescue_attempts=attempt.rescue_attempts,
+        rescue_error_messages=attempt.rescue_error_messages,
+        rescue_prompts=attempt.rescue_prompts,
+        prompt_tokens=attempt.prompt_tokens,
+        rescue_prompt_tokens=attempt.rescue_prompt_tokens,
+        execution_error=attempt.execution_error,
+        execution_warnings=attempt.execution_warnings,
+        result=attempt.result,
+        validation=attempt.validation,
         schema=schema_text,
         retrieved_examples=retrieved,
+        cascade_mode_level=cascade_mode_level,
+        cascade_mode_attempts=len(cascade_mode_prompts),
+        cascade_mode_prompts=cascade_mode_prompts,
+        cascade_mode_prompt_tokens=cascade_mode_prompt_tokens,
     )

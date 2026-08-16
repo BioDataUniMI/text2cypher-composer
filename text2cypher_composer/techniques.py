@@ -123,8 +123,27 @@ class SchemaComponent(str, Enum):
 SchemaComponentLike = Union[str, SchemaComponent]
 
 DEFAULT_SCHEMA_COMPONENTS = frozenset({SchemaComponent.ENTITY_TYPES})
+ALL_SCHEMA_COMPONENTS = frozenset(SchemaComponent)
 
 
 def list_schema_components() -> List[str]:
     """Return the string values accepted by `run()`'s `schema_components` argument."""
     return [c.value for c in SchemaComponent]
+
+
+class CascadeModeLevel(str, Enum):
+    """A rung of the `cascade_mode` cascade (see `run()`'s `cascade_mode` argument).
+
+    - "narrow": the most aggressively pruned schema — node labels,
+      relationship types, and node/relationship properties all narrowed to
+      what's relevant to the question (`ALL_SCHEMA_COMPONENTS`).
+    - "nodes_only": a less aggressive fallback — only node labels are
+      matched (`DEFAULT_SCHEMA_COMPONENTS`); relationships are kept via
+      shared endpoints among the selected labels, and every property of a
+      selected label/type is kept.
+    - "full": the unpruned schema — the final fallback, always tried last.
+    """
+
+    NARROW = "narrow"
+    NODES_ONLY = "nodes_only"
+    FULL = "full"

@@ -129,6 +129,8 @@ def show(result, show_prompt=False):
     (how much schema filtering saves); `result.rescue_prompt_tokens` is the
     parallel per-attempt count for rescue_prompts (a list of rescue_attempts
     numbers when rescued — how many extra tokens rescue_prompt costs).
+    `result.cascade_mode_level`/`cascade_mode_attempts` (only set when
+    cascade_mode=True) are printed too, if present.
     \"\"\"
     print(f"Technique:        {result.technique}")
     print(f"Model:            {result.model}")
@@ -187,6 +189,10 @@ def show(result, show_prompt=False):
             print(f"  [attempt {i}] error_message sent to the fix-up prompt:")
             for line in msg.splitlines():
                 print(f"    {line}")
+
+    if result.cascade_mode_level:
+        print(f"\\nSchema fallback rung used: {result.cascade_mode_level}  (of {result.cascade_mode_attempts} tried)")
+        print(f"Cascade prompt tokens: {result.cascade_mode_prompt_tokens}")  # one per rung tried
 """)
 
 md("""\
@@ -833,13 +839,13 @@ md("""\
 with a second "fix this query" prompt — reusing the same schema/examples context as the
 technique, plus the bad query and an `error_message`. Ported from the miRNAKG rescue-prompt
 notebook, and `error_message` concatenates every signal available about the failure: the native
-Neo4j error (if the query didn't execute), any Neo4j notifications observed during execution
-(deprecated syntax, unknown labels/relationship-types/properties, cartesian products, ...) —
-captured the same way the notebook's `execute_query_with_warnings` did — an `"Empty result
-set."` note if it executed but returned nothing, and **CyVer's validation report** (both its
-warning-level notifications and hard errors), which `run()` already computes for every query.
-`max_retries` (default `1`) caps how many rescue attempts are made, stopping early once one
-succeeds.
+Neo4j error (if the query didn't execute), an `"Empty result set."` note if it executed but
+returned nothing, and **CyVer's validation report** (both its warning-level notifications and
+hard errors), which `run()` already computes for every query. Raw Neo4j notifications
+(deprecated syntax, unknown labels/relationship-types/properties, cartesian products, ... —
+still captured separately on `result.execution_warnings`) are deliberately left out to save
+tokens: CyVer's own validators already surface the ones that matter for a fix-up. `max_retries`
+(default `1`) caps how many rescue attempts are made, stopping early once one succeeds.
 
 We reuse the same deliberately-broken query from §7, via a fake "model" that returns it on the
 *first* call only — every call after (i.e. the rescue attempt) returns a working query — so we
@@ -873,7 +879,96 @@ show(result_rescued, show_prompt=True)  # show_prompt=True: prints the initial p
 """)
 
 md("""\
-## 9. Fine-tuning your own model
+## 9. Cascading schema fallback (`cascade_mode`)
+
+Schema pruning (§4.3-4.7) can over-prune: too little schema in the prompt, and the model can't
+write a correct query at all. `cascade_mode=True` (default `False`) retries the *whole*
+generation — a fresh prompt, not `rescue_prompt`'s error-aware fix-up — with progressively less
+aggressive pruning whenever an attempt fails to execute or comes back empty, stopping early once
+one rung succeeds:
+
+1. **`"narrow"`**: node labels, relationship types, *and* properties all narrowed to the
+   question — skipped entirely if `skip_narrow_schema_filter=True`.
+2. **`"nodes_only"`**: only node labels are matched; relationships are kept via shared endpoints
+   among the selected labels, and every property of a selected label/type is kept.
+3. **`"full"`**: the unpruned schema — the final fallback, always tried last.
+
+Only meaningful for a pruning `schema_mode` (`"exact_match"`, `"ner_exact_match"`, `"similarity"`,
+`"llm_pruning"`, `"ie_extraction"`) — `"schema"`/`"enhanced"` have nothing to prune from.
+
+**`cascade_mode` and `rescue_prompt`/`max_retries` are mutually exclusive** — two different retry
+strategies for the same problem (a failing/empty query), not meant to be stacked. `run()` raises
+`ValueError` if both are set:
+""")
+
+code("""\
+try:
+    run(
+        input_NL=input_NL,
+        model="gpt-4o",
+        database=database,
+        technique="Schema",
+        schema_mode="exact_match",
+        cascade_mode=True,
+        rescue_prompt=True,
+    )
+except ValueError as e:
+    print("Mutual-exclusivity caught as expected:", e)
+""")
+
+md("""\
+We reuse the same deliberately-broken query from §7, via a fake "model" that only manages to
+write a correct query starting from its *second* call — with `cascade_mode=True`, that second
+call is the `"nodes_only"` rung (the `"narrow"` rung's attempt is the one that fails).
+""")
+
+code("""\
+cascade_call_count = {"n": 0}
+
+def flaky_until_less_pruned(_):
+    cascade_call_count["n"] += 1
+    if cascade_call_count["n"] == 1:
+        return broken_cypher  # the same broken query from §7 -- fails on the "narrow" rung
+    return "MATCH (m:miRNA) RETURN m.Label AS miRNA LIMIT 5"  # works from "nodes_only" onward
+
+result_cascade = run(
+    input_NL=input_NL,
+    model=RunnableLambda(flaky_until_less_pruned),
+    database=database,
+    technique="Schema",
+    schema_mode="exact_match",
+    cascade_mode=True,
+)
+
+print("Rung used:   ", result_cascade.cascade_mode_level)      # "narrow" / "nodes_only" / "full"
+print("Rungs tried: ", result_cascade.cascade_mode_attempts)   # 1..3
+print("Final cypher:", result_cascade.cypher)
+show(result_cascade)
+""")
+
+md("""\
+`skip_narrow_schema_filter=True` skips straight to the `"nodes_only"` rung — useful once you know
+the `"narrow"` rung tends to over-prune for your schema/questions and isn't worth the extra
+generation call:
+""")
+
+code("""\
+result_cascade_skip_narrow = run(
+    input_NL=input_NL,
+    model="gpt-4o",
+    database=database,
+    technique="Schema",
+    schema_mode="exact_match",
+    cascade_mode=True,
+    skip_narrow_schema_filter=True,
+)
+
+print("Rung used:", result_cascade_skip_narrow.cascade_mode_level)  # never "narrow" here
+show(result_cascade_skip_narrow)
+""")
+
+md("""\
+## 10. Fine-tuning your own model
 
 Two paths to a model specialized on your own question→Cypher examples, ported from
 `bio2C/evaluating_text2cypher/evaluating_text2cypher_gpt.ipynb` (dataset preparation) and
@@ -891,7 +986,7 @@ Both paths start from the same leveled gold dataset.
 """)
 
 md("""\
-### 9.1 Loading a leveled gold dataset
+### 10.1 Loading a leveled gold dataset
 
 bio2C organizes fine-tuning gold sets into "levels" (`nodeLevel`, `1hop`, `2hop`, `3hop`,
 `hardLevel`, ...), each a JSON file of `{"question", "cypher"}` records. `load_finetune_levels`
@@ -919,7 +1014,7 @@ ft_df
 """)
 
 md("""\
-### 9.2 Sizing a token budget, and a stratified train/test split
+### 10.2 Sizing a token budget, and a stratified train/test split
 
 `max_cypher_tokens` sizes a generation `max_tokens` budget from the longest gold query (useful
 for fine-tuning as well as bulk evaluation, so it isn't needlessly large — that slows things
@@ -938,9 +1033,9 @@ train_df
 """)
 
 md("""\
-### 9.3 Exporting for fine-tuning
+### 10.3 Exporting for fine-tuning
 
-`write_local_finetune_dataset` writes the format `finetune_lora` (§9.4) reads back in;
+`write_local_finetune_dataset` writes the format `finetune_lora` (§10.4) reads back in;
 `build_gpt_finetune_jsonl` writes the chat-format `.jsonl` OpenAI's fine-tuning GUI expects —
 one `{"messages": [...]}` line per example, with an optional system message.
 """)
@@ -958,7 +1053,7 @@ with open(gpt_jsonl.path, encoding="utf-8") as f:
 """)
 
 md("""\
-### 9.4 LoRA-finetuning a local model
+### 10.4 LoRA-finetuning a local model
 
 `finetune_lora` LoRA-finetunes a 4-bit-quantized base causal LM (`LoRATrainingConfig.base_model`
 defaults to `meta-llama/Llama-3.1-8B`, matching the notebook) on `train_df`'s question/Cypher
@@ -981,7 +1076,7 @@ code("""\
 """)
 
 md("""\
-### 9.5 Using the fine-tuned (or any local) model with `run()`
+### 10.5 Using the fine-tuned (or any local) model with `run()`
 
 `load_finetuned_model` loads the adapter back as a `HuggingFacePipeline` `Runnable`,
 pre-configured with its own generation parameters — pass it straight through as `run()`'s
@@ -989,7 +1084,7 @@ pre-configured with its own generation parameters — pass it straight through a
 match the notebook's inference-time prompt. A non-finetuned local pipeline (e.g. straight from
 `bio2C/evaluating_text2cypher/evaluating_text2cypher_llama.ipynb`) works the same way — just
 build the `HuggingFacePipeline` yourself instead of via `load_finetuned_model`. Also
-demonstration-only (needs a GPU, the same Hugging Face login from §9.4, and the model weights
+demonstration-only (needs a GPU, the same Hugging Face login from §10.4, and the model weights
 available).
 """)
 
@@ -1007,14 +1102,14 @@ code("""\
 """)
 
 md("""\
-## 10. Discovering available techniques and their prompts
+## 11. Discovering available techniques and their prompts
 
 A few introspection helpers, useful without needing a database/model/dataset at hand — e.g. to
 build a UI, validate a `technique` string before calling `run()`, or just remember what each
 technique needs and what it sends the model.
 """)
 
-md("### 10.1 `list_techniques()` — the accepted `technique` strings")
+md("### 11.1 `list_techniques()` — the accepted `technique` strings")
 
 code("""\
 from text2cypher_composer import list_techniques
@@ -1023,7 +1118,7 @@ list_techniques()
 """)
 
 md("""\
-### 10.2 `describe_technique()` / `list_technique_info()` — what each technique needs
+### 11.2 `describe_technique()` / `list_technique_info()` — what each technique needs
 
 Tells you whether a technique uses the enhanced schema and/or RAG (and, if RAG, whether it's the
 output-augmented `+O` variant) — i.e. whether `dataset` must be passed to `run()`.
@@ -1039,7 +1134,7 @@ for info in list_technique_info():
 """)
 
 md("""\
-### 10.3 `get_prompt_template()` / `get_all_prompt_templates()` — the parametric prompts
+### 11.3 `get_prompt_template()` / `get_all_prompt_templates()` — the parametric prompts
 
 The **unfilled** prompt for a technique — placeholders like `{question}`, `{enhanced_schema}`,
 `{examples}` are left as literal text. This is the template; for the fully-instantiated prompt
@@ -1061,7 +1156,7 @@ print(list(all_templates.keys()))
 """)
 
 md("""\
-## 11. Bulk evaluation against a gold test set
+## 12. Bulk evaluation against a gold test set
 
 `evaluate_technique` runs a technique over a whole gold `(question, query)` set and reports
 Jaro-Winkler, normalized Levenshtein, Jaccard, Coverage, and pass@k. We reuse the mock
@@ -1113,7 +1208,7 @@ eval_df[[
 """)
 
 md("""\
-## 12. Summary
+## 13. Summary
 
 - `run()` always returns a `Text2CypherResult` with: `question`, `technique`, `model`,
   `initial_cypher` (what the model generated first), `cypher` (the final, possibly rescued
@@ -1141,8 +1236,9 @@ md("""\
   attempt's actual execution) are always populated on every `Text2CypherResult`, independently of
   `rescue_prompt`.
 - `rescue_prompt=True` (§8) retries a failed/empty query with a fix-up prompt whose
-  `error_message` concatenates the native Neo4j error, execution warnings, and CyVer's report, up
-  to `max_retries` (default `1`, must be `>= 1`) times — `result.rescued`/`result.rescue_attempts`
+  `error_message` concatenates the native Neo4j error and CyVer's report (raw Neo4j notifications
+  are left out — CyVer's own validators already surface the ones that matter), up to
+  `max_retries` (default `1`, must be `>= 1`) times — `result.rescued`/`result.rescue_attempts`
   report whether and how many times that happened; `result.rescue_error_messages`/
   `result.rescue_prompts` hold, per attempt, the `error_message` sent and the exact
   fully-instantiated messages sent for it.
@@ -1151,7 +1247,13 @@ md("""\
   filtering actually saves; `result.rescue_prompt_tokens` is the parallel per-attempt count for
   `rescue_prompts` — a list of `rescue_attempts` numbers, to see how many extra tokens
   `rescue_prompt` costs.
-- Fine-tuning (§9): `load_finetune_levels`/`max_cypher_tokens`/`split_finetune_dataset` prepare a
+- `cascade_mode=True` (§9) retries a failed/empty query from scratch with progressively less
+  aggressive schema pruning ("narrow" → "nodes_only" → "full", `skip_narrow_schema_filter=True`
+  to start at "nodes_only"), stopping at the first rung that succeeds — a different retry
+  strategy than `rescue_prompt`'s error-aware fix-up, so the two are mutually exclusive.
+  `result.cascade_mode_level`/`result.cascade_mode_attempts`/`result.cascade_mode_prompts`/
+  `result.cascade_mode_prompt_tokens` report which rung was used and what each tried rung cost.
+- Fine-tuning (§10): `load_finetune_levels`/`max_cypher_tokens`/`split_finetune_dataset` prepare a
   leveled gold dataset, `write_local_finetune_dataset`/`build_gpt_finetune_jsonl` export it for
   `finetune_lora` (LoRA-finetune a local model) or OpenAI's fine-tuning GUI respectively; either
   way, the resulting model — a fine-tuned model id (string) or `load_finetuned_model`'s
@@ -1165,8 +1267,8 @@ md("""\
 - The available techniques are listed in `Technique`
   (`from text2cypher_composer import Technique`), or as plain strings via `list_techniques()`.
   `describe_technique()`/`list_technique_info()` tell you what each one needs, and
-  `get_prompt_template()`/`get_all_prompt_templates()` show its unfilled prompt (§10).
-- `evaluate_technique()` (§11) runs a technique over a gold test set and reports
+  `get_prompt_template()`/`get_all_prompt_templates()` show its unfilled prompt (§11).
+- `evaluate_technique()` (§12) runs a technique over a gold test set and reports
   Jaro-Winkler, Levenshtein, Jaccard, Coverage, and pass@k as an `EvaluationReport`
   (`.summary` for dataset-level averages, `.to_dataframe()` for a per-question table).
   `rescue_prompt`/`max_retries` forward to every attempt, and `.to_dataframe()`/

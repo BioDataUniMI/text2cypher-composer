@@ -1,5 +1,12 @@
 from text2cypher_composer import Technique, describe_technique, list_technique_info, list_techniques
-from text2cypher_composer.techniques import OUTPUT_AUGMENTED_TECHNIQUES, RAG_TECHNIQUES, SCHEMA_TECHNIQUES
+from text2cypher_composer.techniques import (
+    ALL_SCHEMA_COMPONENTS,
+    DEFAULT_SCHEMA_COMPONENTS,
+    OUTPUT_AUGMENTED_TECHNIQUES,
+    RAG_TECHNIQUES,
+    SCHEMA_TECHNIQUES,
+    SchemaComponent,
+)
 
 
 def test_list_techniques_matches_enum():
@@ -33,3 +40,9 @@ def test_every_schema_or_rag_technique_is_a_real_technique():
     assert SCHEMA_TECHNIQUES <= set(Technique)
     assert RAG_TECHNIQUES <= set(Technique)
     assert OUTPUT_AUGMENTED_TECHNIQUES <= set(Technique)
+
+
+def test_all_schema_components_covers_every_component():
+    # the cascade_mode "narrow" rung's aggressiveness comes from this being everything
+    assert ALL_SCHEMA_COMPONENTS == set(SchemaComponent)
+    assert DEFAULT_SCHEMA_COMPONENTS < ALL_SCHEMA_COMPONENTS

@@ -17,7 +17,7 @@ backed by the real `schemalink-engine` PyPI package.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yaml
 from langchain_core.prompts import ChatPromptTemplate
@@ -25,6 +25,8 @@ from pydantic import BaseModel, Field
 
 from .schema import format_schema, get_schema, get_structured_schema
 from .techniques import (
+    ALL_SCHEMA_COMPONENTS,
+    CascadeModeLevel,
     DEFAULT_SCHEMA_COMPONENTS,
     SchemaComponent,
     SchemaComponentLike,
@@ -202,14 +204,8 @@ def ner_exact_match_prune(
     return exact_match_prune(structured_schema, mask_entities(question, nlp), components=components)
 
 
-def similarity_prune(
-    structured_schema: Dict[str, Any], question: str, nlp: Any, threshold: float = 0.5
-) -> Dict[str, Any]:
-    """Keep labels/types/properties whose word-vector similarity to the question exceeds `threshold`.
-
-    Unlike `exact_match_prune`, there is no full-schema fallback: if nothing
-    is similar enough, the pruned schema is empty.
-    """
+def _similarity_matcher(nlp: Any, question: str, threshold: float):
+    """Build the `_similar(term) -> bool` closure `similarity_prune`/`similarity_prune_nodes_only` share."""
     qdoc = nlp(question.lower())
     q_tokens = [t for t in qdoc if t.is_alpha and t.has_vector]
 
@@ -221,6 +217,19 @@ def similarity_prune(
         if not lex.has_vector:
             return False
         return any(qt.similarity(lex) >= threshold for qt in q_tokens)
+
+    return _similar
+
+
+def similarity_prune(
+    structured_schema: Dict[str, Any], question: str, nlp: Any, threshold: float = 0.5
+) -> Dict[str, Any]:
+    """Keep labels/types/properties whose word-vector similarity to the question exceeds `threshold`.
+
+    Unlike `exact_match_prune`, there is no full-schema fallback: if nothing
+    is similar enough, the pruned schema is empty.
+    """
+    _similar = _similarity_matcher(nlp, question, threshold)
 
     node_props = structured_schema.get("node_props", {}) or {}
     pruned_node_props = {}
@@ -251,6 +260,26 @@ def similarity_prune(
     }
 
 
+def similarity_prune_nodes_only(
+    structured_schema: Dict[str, Any], question: str, nlp: Any, threshold: float = 0.5
+) -> Dict[str, Any]:
+    """`similarity_prune`, but only node-label similarity anchors the selection.
+
+    A less aggressive fallback than `similarity_prune`: node labels are
+    matched by word-vector similarity same as before, but relationship
+    types/properties are not independently matched — instead, relationships
+    are kept when both endpoints are among the selected labels, and every
+    property of a selected label is kept (see `_apply_selection`), the same
+    "nodes only" semantics `exact_match_prune`/`ner_exact_match_prune` get
+    from `components=DEFAULT_SCHEMA_COMPONENTS`. Falls back to the full
+    schema if no label is similar enough.
+    """
+    _similar = _similarity_matcher(nlp, question, threshold)
+    node_props = structured_schema.get("node_props", {}) or {}
+    matched_nodes = [n for n in node_props if _similar(n)]
+    return _apply_selection(structured_schema, matched_nodes, [])
+
+
 class SchemaSelection(BaseModel):
     """Node labels and relationship types from a Neo4j schema relevant to a question."""
 
@@ -274,15 +303,34 @@ _LLM_PRUNING_SYSTEM = (
 _LLM_PRUNING_TEMPLATE = "Schema:\n{schema}\n\nQuestion: {question}"
 
 
-def llm_prune(structured_schema: Dict[str, Any], question: str, llm: Any) -> Dict[str, Any]:
-    """Ask `llm` (via structured/JSON-schema output) which labels/relationship types are relevant."""
+def _llm_select(structured_schema: Dict[str, Any], question: str, llm: Any) -> SchemaSelection:
+    """The `llm.with_structured_output` call `llm_prune`/`llm_prune_nodes_only` share."""
     full_schema_text = format_schema(structured_schema, is_enhanced=True)
     prompt = ChatPromptTemplate.from_messages(
         [("system", _LLM_PRUNING_SYSTEM), ("human", _LLM_PRUNING_TEMPLATE)]
     )
     chain = prompt | llm.with_structured_output(SchemaSelection, method="json_schema")
-    selection = chain.invoke({"schema": full_schema_text, "question": question})
+    return chain.invoke({"schema": full_schema_text, "question": question})
+
+
+def llm_prune(structured_schema: Dict[str, Any], question: str, llm: Any) -> Dict[str, Any]:
+    """Ask `llm` (via structured/JSON-schema output) which labels/relationship types are relevant."""
+    selection = _llm_select(structured_schema, question, llm)
     return _apply_selection(structured_schema, selection.node_labels, selection.relationship_types)
+
+
+def llm_prune_nodes_only(structured_schema: Dict[str, Any], question: str, llm: Any) -> Dict[str, Any]:
+    """`llm_prune`, but only the model's node-label selection is used.
+
+    A less aggressive fallback than `llm_prune`: the model is still asked
+    for both node labels and relationship types (same call), but only
+    `node_labels` is used — relationships are instead kept via shared
+    endpoints among the selected labels (see `_apply_selection`), the same
+    "nodes only" semantics `exact_match_prune`/`ner_exact_match_prune` get
+    from `components=DEFAULT_SCHEMA_COMPONENTS`.
+    """
+    selection = _llm_select(structured_schema, question, llm)
+    return _apply_selection(structured_schema, selection.node_labels, [])
 
 
 def structured_schema_to_linkml(
@@ -507,3 +555,80 @@ def resolve_schema_text(
         )
 
     raise ValueError(f"Unknown schema_mode: {mode}")
+
+
+def resolve_cascade_mode_levels(
+    graph: Any,
+    mode: SchemaModeLike,
+    question: str,
+    llm: Optional[Any] = None,
+    nlp: Optional[Any] = None,
+    similarity_threshold: float = 0.5,
+    ie_engine: Optional[Any] = None,
+    skip_narrow: bool = False,
+) -> List[Tuple[CascadeModeLevel, str]]:
+    """Resolve the schema text for each rung of the `cascade_mode` cascade, in order.
+
+    Returns `[(level, schema_text), ...]`, trying progressively less
+    aggressive pruning: `CascadeModeLevel.NARROW` (node labels,
+    relationship types, and properties all narrowed to the question —
+    `ALL_SCHEMA_COMPONENTS`; skipped entirely if `skip_narrow`),
+    `CascadeModeLevel.NODES_ONLY` (only node labels matched —
+    `DEFAULT_SCHEMA_COMPONENTS`; relationships kept via shared endpoints,
+    every property of a selected label/type kept), then always
+    `CascadeModeLevel.FULL` last (the unpruned schema).
+
+    `mode` must be a pruning schema_mode — `"exact_match"`,
+    `"ner_exact_match"`, `"similarity"`, `"llm_pruning"`, or
+    `"ie_extraction"`. `"schema"`/`"enhanced"` have nothing to prune from and
+    raise `ValueError`, same as passing `cascade_mode=True` for a
+    non-schema technique would in `run()`. `llm`/`nlp`/`ie_engine` are
+    required by the same modes `resolve_schema_text` requires them for.
+    """
+    mode = SchemaMode(mode)
+    if mode in (SchemaMode.SCHEMA, SchemaMode.ENHANCED):
+        raise ValueError(
+            f"schema_mode='{mode.value}' has nothing to prune — cascade_mode requires a "
+            "pruning schema_mode (exact_match, ner_exact_match, similarity, llm_pruning, or "
+            "ie_extraction)."
+        )
+    if mode in (SchemaMode.NER_EXACT_MATCH, SchemaMode.SIMILARITY) and nlp is None:
+        raise ValueError(f"schema_mode='{mode.value}' requires an `nlp` argument.")
+    if mode == SchemaMode.LLM_PRUNING and llm is None:
+        raise ValueError("schema_mode='llm_pruning' requires a structured-output-capable model.")
+    if mode == SchemaMode.IE_EXTRACTION and ie_engine is None:
+        raise ValueError("schema_mode='ie_extraction' requires an `ie_engine` argument.")
+
+    is_enhanced = mode != SchemaMode.SIMILARITY
+    structured = get_structured_schema(graph, is_enhanced=is_enhanced)
+
+    levels: List[Tuple[CascadeModeLevel, str]] = []
+
+    if not skip_narrow:
+        if mode == SchemaMode.EXACT_MATCH:
+            narrow = exact_match_prune(structured, question, components=ALL_SCHEMA_COMPONENTS)
+        elif mode == SchemaMode.NER_EXACT_MATCH:
+            narrow = ner_exact_match_prune(structured, question, nlp, components=ALL_SCHEMA_COMPONENTS)
+        elif mode == SchemaMode.SIMILARITY:
+            narrow = similarity_prune(structured, question, nlp, threshold=similarity_threshold)
+        elif mode == SchemaMode.LLM_PRUNING:
+            narrow = llm_prune(structured, question, llm)
+        else:  # IE_EXTRACTION
+            narrow = ie_prune(structured, question, ie_engine, components=ALL_SCHEMA_COMPONENTS)
+        levels.append((CascadeModeLevel.NARROW, format_schema(narrow, is_enhanced=is_enhanced)))
+
+    if mode == SchemaMode.EXACT_MATCH:
+        nodes_only = exact_match_prune(structured, question, components=DEFAULT_SCHEMA_COMPONENTS)
+    elif mode == SchemaMode.NER_EXACT_MATCH:
+        nodes_only = ner_exact_match_prune(structured, question, nlp, components=DEFAULT_SCHEMA_COMPONENTS)
+    elif mode == SchemaMode.SIMILARITY:
+        nodes_only = similarity_prune_nodes_only(structured, question, nlp, threshold=similarity_threshold)
+    elif mode == SchemaMode.LLM_PRUNING:
+        nodes_only = llm_prune_nodes_only(structured, question, llm)
+    else:  # IE_EXTRACTION
+        nodes_only = ie_prune(structured, question, ie_engine, components=DEFAULT_SCHEMA_COMPONENTS)
+    levels.append((CascadeModeLevel.NODES_ONLY, format_schema(nodes_only, is_enhanced=is_enhanced)))
+
+    levels.append((CascadeModeLevel.FULL, get_schema(graph, is_enhanced=is_enhanced)))
+
+    return levels
