@@ -74,6 +74,16 @@ def test_build_error_message_concatenates_execution_and_cyver_signals():
     assert msg.index("Neo4j runtime error: boom") < msg.index("SYN001")
 
 
+def test_build_error_message_includes_semantic_feedback_when_given():
+    msg = build_error_message(True, [{"c": 1}], _validation(), semantic_feedback="wrong relationship direction")
+    assert "Semantic review: wrong relationship direction" in msg
+
+
+def test_build_error_message_omits_semantic_feedback_when_none():
+    msg = build_error_message(True, [{"c": 1}], _validation(), semantic_feedback=None)
+    assert "Semantic review" not in msg
+
+
 def test_rescue_messages_dispatch_by_technique_flags():
     vanilla = rescue_messages(uses_schema=False, uses_rag=False)
     schema = rescue_messages(uses_schema=True, uses_rag=False)

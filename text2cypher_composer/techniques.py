@@ -147,3 +147,45 @@ class CascadeModeLevel(str, Enum):
     NARROW = "narrow"
     NODES_ONLY = "nodes_only"
     FULL = "full"
+
+
+class CascadeStrategy(str, Enum):
+    """How `cascade_mode`'s rungs are prompted (see `run()`'s `cascade_strategy` argument).
+
+    - "standard" (default): each rung's prompt carries that rung's *full*
+      schema (narrow, then nodes_only, then full) as a fresh, self-contained
+      generation — no reference to a previous rung's attempt.
+    - "delta": the "Incremental delta cascade". Only the first rung
+      ("narrow") gets a full, self-contained prompt. Every rung after that
+      is instead a rescue-style continuation (see `rescue.rescue_messages`/
+      `rescue.build_error_message`) built from the *previous* rung's
+      generated query and why it needed to move on, showing only the schema
+      elements newly introduced at this rung (`schema_modes.schema_delta`) —
+      not the ones already shown at a previous rung. This cuts redundant
+      schema tokens repeated across rungs, at the cost of each rung after
+      the first depending on the previous rung's output.
+    """
+
+    STANDARD = "standard"
+    DELTA = "delta"
+
+
+CascadeStrategyLike = Union[str, CascadeStrategy]
+
+
+class RAGExpansionLevel(str, Enum):
+    """A rung of the `adaptive_rag` cascade (see `run()`'s `adaptive_rag` argument).
+
+    The RAG-side sibling of `CascadeModeLevel`: instead of progressively
+    less pruned schema, each rung retrieves progressively more RAG examples.
+
+    - "minimal": a single retrieved example (`n_results=1`).
+    - "moderate": `RAGDataset.n_results` examples — today's default retrieval
+      behavior.
+    - "full": every example in the collection (`n_results=collection.count()`)
+      — the final fallback, always tried last.
+    """
+
+    MINIMAL = "minimal"
+    MODERATE = "moderate"
+    FULL = "full"

@@ -131,6 +131,38 @@ def test_to_dataframe_rescue_columns_default_when_not_rescued():
     assert row["execution_warnings"] == []
 
 
+def test_to_dataframe_includes_self_verification_columns():
+    verified_result = _fake_result(
+        self_verification_passed=False,
+        self_verification_reasoning="wrong relationship direction",
+    )
+    details = [_fake_question_evaluation(attempts=[verified_result])]
+    report = EvaluationReport(
+        summary=EvaluationSummary(
+            technique="Schema+RAG",
+            model="gpt-4o-mini",
+            n_questions=1,
+            k=1,
+            mean_jaro_winkler=1.0,
+            mean_levenshtein=1.0,
+            mean_jaccard=1.0,
+            mean_coverage=1.0,
+            pass_at_k={1: 1.0},
+        ),
+        details=details,
+    )
+
+    row = report.to_dataframe().iloc[0]
+    assert bool(row["self_verification_passed"]) is False
+    assert row["self_verification_reasoning"] == "wrong relationship direction"
+
+
+def test_to_dataframe_self_verification_columns_default_when_not_used():
+    row = _fake_report().to_dataframe().iloc[0]
+    assert row["self_verification_passed"] is None
+    assert row["self_verification_reasoning"] is None
+
+
 def test_to_dataframe_retrieved_examples_none_for_non_rag():
     non_rag_result = _fake_result(technique="vanilla", retrieved_examples=None)
     details = [_fake_question_evaluation(attempts=[non_rag_result])]
@@ -184,6 +216,41 @@ def test_evaluate_technique_defaults_rescue_prompt_to_false():
 
     assert mock_run.call_args.kwargs["rescue_prompt"] is False
     assert mock_run.call_args.kwargs["max_retries"] == 1
+
+
+def test_evaluate_technique_forwards_self_verification_params_to_run():
+    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+
+    with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
+         patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
+         patch("text2cypher_composer.evaluation.run", return_value=_fake_result()) as mock_run:
+        evaluate_technique(
+            df,
+            model="gpt-4o-mini",
+            database={},
+            technique="vanilla",
+            rescue_prompt=True,
+            self_verification=True,
+            verification_model="gpt-4o",
+            verification_criteria="must include units",
+        )
+
+    assert mock_run.call_args.kwargs["self_verification"] is True
+    assert mock_run.call_args.kwargs["verification_model"] == "gpt-4o"
+    assert mock_run.call_args.kwargs["verification_criteria"] == "must include units"
+
+
+def test_evaluate_technique_defaults_self_verification_to_false():
+    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+
+    with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
+         patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
+         patch("text2cypher_composer.evaluation.run", return_value=_fake_result()) as mock_run:
+        evaluate_technique(df, model="gpt-4o-mini", database={}, technique="vanilla")
+
+    assert mock_run.call_args.kwargs["self_verification"] is False
+    assert mock_run.call_args.kwargs["verification_model"] is None
+    assert mock_run.call_args.kwargs["verification_criteria"] is None
 
 
 def test_save_evaluation_report_writes_pkl_and_xlsx(tmp_path):

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 
-from text2cypher_composer.schemalink_adapter import _filter_schema_yaml, schemalink_ie_engine
+from text2cypher_composer.schemalink_adapter import _filter_schema_yaml, _normalize_extraction, schemalink_ie_engine
 
 _SCHEMA_YAML = yaml.safe_dump(
     {
@@ -85,6 +85,23 @@ def _install_fake_schemalink_engine(monkeypatch, fake_run_extraction_pipeline):
     monkeypatch.setitem(sys.modules, "schemalink_engine.pipeline", pipeline_module)
 
 
+def test_normalize_extraction_unwraps_schema_response():
+    # the real schemalink-engine pipeline nests each class's payload under "schemaResponse"
+    raw = {
+        "miRNA": {"schemaResponse": {"mentions": [{"Label": "precursor"}]}},
+        "Gene": {"schemaResponse": {}},  # no mentions found for this class
+    }
+    assert _normalize_extraction(raw) == {
+        "miRNA": {"mentions": [{"Label": "precursor"}]},
+        "Gene": {},
+    }
+
+
+def test_normalize_extraction_passes_through_already_flat_entries():
+    raw = {"miRNA": {"mentions": [{"Label": "precursor"}]}}
+    assert _normalize_extraction(raw) == raw
+
+
 def test_schemalink_ie_engine_writes_files_calls_pipeline_and_reads_output(monkeypatch, tmp_path):
     captured = {}
 
@@ -95,10 +112,11 @@ def test_schemalink_ie_engine_writes_files_calls_pipeline_and_reads_output(monke
         captured["text_path_existed"] = os.path.exists(kwargs["text_path"])
         with open(kwargs["text_path"], encoding="utf-8") as f:
             captured["text_content"] = f.read()
-        # simulate the real pipeline: writes its output relative to the current cwd
+        # simulate the real pipeline: writes its output relative to the current cwd, nested
+        # under "schemaResponse" per class (see _normalize_extraction)
         os.makedirs("output", exist_ok=True)
         with open("output/generated_responses.json", "w", encoding="utf-8") as f:
-            json.dump({"miRNA": {"mentions": [{"Label": "precursor"}]}}, f)
+            json.dump({"miRNA": {"schemaResponse": {"mentions": [{"Label": "precursor"}]}}}, f)
 
     _install_fake_schemalink_engine(monkeypatch, fake_run_extraction_pipeline)
 

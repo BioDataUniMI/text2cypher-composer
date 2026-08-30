@@ -1,6 +1,8 @@
 from .core import Text2CypherResult, run
 from .dataset_builder import RAGExampleFiles, build_rag_example_files
+from .display import show
 from .embeddings import EmbeddingMeta, embedding_backend_for, resolve_embedder
+from .graph_db import resolve_database
 from .evaluation import (
     EvaluationReport,
     EvaluationSummary,
@@ -30,9 +32,11 @@ from .metrics import (
     normalized_levenshtein_similarity,
 )
 from .prompts import get_all_prompt_templates, get_prompt_template
-from .rag import RAGDataset
+from .rag import RAGDataset, resolve_adaptive_rag_levels
 from .rescue import build_error_message, needs_rescue
+from .schema import clear_schema_cache, get_schema, get_structured_schema
 from .schemalink_adapter import schemalink_ie_engine
+from .verification import SemanticVerification, verify_semantics
 from .schema_modes import (
     SchemaSelection,
     exact_match_prune,
@@ -42,6 +46,7 @@ from .schema_modes import (
     mask_entities,
     ner_exact_match_prune,
     resolve_cascade_mode_levels,
+    schema_delta,
     similarity_prune,
     similarity_prune_nodes_only,
     structured_schema_to_linkml,
@@ -49,6 +54,8 @@ from .schema_modes import (
 from .techniques import (
     ALL_SCHEMA_COMPONENTS,
     CascadeModeLevel,
+    CascadeStrategy,
+    RAGExpansionLevel,
     SchemaComponent,
     SchemaMode,
     Technique,
@@ -63,6 +70,7 @@ from .validation import CypherValidationReport
 
 __all__ = [
     "run",
+    "show",
     "Text2CypherResult",
     "RAGDataset",
     "Technique",
@@ -90,7 +98,11 @@ __all__ = [
     "list_schema_components",
     "ALL_SCHEMA_COMPONENTS",
     "CascadeModeLevel",
+    "CascadeStrategy",
     "resolve_cascade_mode_levels",
+    "schema_delta",
+    "RAGExpansionLevel",
+    "resolve_adaptive_rag_levels",
     "SchemaSelection",
     "exact_match_prune",
     "ner_exact_match_prune",
@@ -104,6 +116,12 @@ __all__ = [
     "mask_entities",
     "needs_rescue",
     "build_error_message",
+    "clear_schema_cache",
+    "get_schema",
+    "get_structured_schema",
+    "resolve_database",
+    "SemanticVerification",
+    "verify_semantics",
     "LoRATrainingConfig",
     "LoRAFinetuneResult",
     "build_prompt_completion_pairs",

@@ -96,6 +96,12 @@ print(result.execution_warnings)        # Neo4j notifications observed during ex
 print(result.prompt_tokens)             # prompt's tiktoken token count, or None if tiktoken isn't installed
 ```
 
+`show(result)` — also exported — is a ready-made pretty-printer instead of printing individual
+fields yourself: the generated Cypher, its result rows, the always-populated CyVer validation
+report, and (when present) rescue/`cascade_mode`/`adaptive_rag`/`self_verification` details. Pass
+`show(result, show_prompt=True)` to also print the exact fully-instantiated prompt(s) sent to the
+model.
+
 ### Techniques
 
 | `technique`        | Uses schema | Uses `dataset` (RAG) |
@@ -259,9 +265,14 @@ It bridges `ie_prune`'s `ie_engine(schema_yaml, question) -> dict` contract to
 schema/text *file paths* and writes its output to a JSON file rather than
 returning it — the adapter writes both to a scratch temp directory (so it
 doesn't litter your cwd with the pipeline's `generated/`/`output/` working
-directories) and reads the output back. It isn't thread-safe (the pipeline
-`chdir`s into that scratch directory for the extraction's duration), so don't
-call it from multiple threads concurrently.
+directories) and reads the output back, unwrapping the `schemaResponse` key
+the real pipeline nests each class's payload under (`{class_name:
+{"schemaResponse": {"mentions": [...]}}}`) into the flat `{class_name:
+{"mentions": [...]}}` shape `ie_prune` expects — without this, every class
+looks mention-free and `ie_prune` silently falls back to the (near-)full
+schema. It isn't thread-safe (the pipeline `chdir`s into that scratch
+directory for the extraction's duration), so don't call it from multiple
+threads concurrently.
 
 `schemalink_ie_engine(include_node_types=True, include_relationship_types=True,
 include_properties=True, with_dependencies=True, ground_entities=None)` — the
@@ -328,6 +339,133 @@ Only meaningful for a pruning `schema_mode` (`"exact_match"`, `"ner_exact_match"
 `run()` raises `ValueError` if combined with `cascade_mode=True`, same as it does for
 `skip_narrow_schema_filter=True` without `cascade_mode=True`, or `cascade_mode=True` with
 `dry_run=True` (there's nothing generated yet to fail/fall back from).
+
+#### `cascade_strategy` — Incremental delta cascade
+
+The cascade above repeats itself: `"narrow"`'s node labels/relationship types show up again,
+folded into `"nodes_only"`'s bigger blob, which shows up again inside `"full"`'s — so a schema
+element already sent to the model in an earlier, failed rung gets paid for again in every later
+rung's prompt. `cascade_strategy="delta"` (default `"standard"`) avoids that redundancy: the first
+rung (`"narrow"`) is still a fresh, self-contained prompt, but every rung after that reuses
+`rescue_prompt`'s error-aware fix-up mechanics — the previous rung's generated query, plus why it
+needed to move on — showing only the schema elements *newly introduced* at this rung
+(`schema_delta`), not the ones a previous rung already showed:
+
+```python
+result = run(
+    input_NL="...",
+    model="gpt-4o",
+    database={},
+    technique="Schema",
+    schema_mode="exact_match",
+    cascade_mode=True,
+    cascade_strategy="delta",
+)
+
+print(result.cascade_mode_level)   # "narrow" / "nodes_only" / "full" — which one was used
+print(result.schema)               # the DELTA text shown at that rung, not the cumulative schema
+print(result.prompt)               # for a rung after the first, a rescue-style continuation prompt
+```
+
+This trades a bit of independence for the savings: a rung after the first is no longer a
+standalone, self-contained attempt — it explicitly depends on the previous rung's output (its
+query and why it failed), the same dependency `rescue_prompt` retries already have. It composes
+with `self_verification` exactly like `rescue_prompt` does: a failed semantic verdict's reasoning
+is folded into the next rung's fix-up context too.
+
+**Requires `cascade_mode=True`** — `run()` raises `ValueError` if `cascade_strategy` is anything
+other than `"standard"` without it.
+
+### `adaptive_rag` (RAG-using techniques only)
+
+RAG retrieval can under-supply context too: too few retrieved examples, and the model may never
+see the pattern it needs to write a correct query. `adaptive_rag=True` (default `False`) is the
+RAG-side sibling of `cascade_mode` above: it retries the *whole* generation — a fresh prompt, not
+`rescue_prompt`'s error-aware fix-up — with progressively **more** retrieved examples whenever an
+attempt fails to execute or comes back empty, stopping early once one rung succeeds:
+
+1. **`"minimal"`**: a single retrieved example (`n_results=1`).
+2. **`"moderate"`**: the dataset's configured `n_results` (its default, `3`) — today's default
+   retrieval behavior.
+3. **`"full"`**: every example in the collection (`n_results=collection.count()`) — the final
+   fallback, always tried last.
+
+```python
+result = run(
+    input_NL="...",
+    model="gpt-4o",
+    database={},
+    technique="RAG",
+    dataset=dataset,
+    adaptive_rag=True,
+)
+
+print(result.adaptive_rag_level)          # "minimal" / "moderate" / "full" — which one was used
+print(result.adaptive_rag_attempts)       # how many levels were tried (1..3)
+print(result.adaptive_rag_prompts)        # the fully-instantiated prompt tried at each level
+print(result.adaptive_rag_prompt_tokens)  # their token counts, parallel to adaptive_rag_prompts
+```
+
+`result.cypher`/`result.executed`/`result.result`/`result.validation`/`result.retrieved_examples`/
+`result.prompt` always reflect the level that was ultimately returned (the first one that
+succeeded, or `"full"` if none did) — same as `cascade_mode`'s existing "reflects the final
+attempt" convention.
+
+**`adaptive_rag` and `cascade_mode`/`rescue_prompt`/`max_retries` are mutually exclusive** — three
+different retry strategies for the same problem (a failing/empty query), not meant to be stacked.
+`run()` raises `ValueError` if `adaptive_rag=True` is combined with any of those; pick one.
+
+Only meaningful for a RAG-using `technique` (`"RAG"`, `"RAG+O"`, `"Schema+RAG"`,
+`"Schema+RAG+O"`) — `run()` raises `ValueError` if combined with a technique that doesn't use RAG,
+or with `dry_run=True` (there's nothing generated yet to fail/fall back from).
+
+### `cache_schema` (schema techniques only)
+
+Extracting a graph's schema from Neo4j isn't free: the base extraction alone is 3+ APOC-backed
+queries, and the "enhanced" schema every pruning `schema_mode` uses (`"exact_match"`,
+`"ner_exact_match"`, `"llm_pruning"`, `"ie_extraction"`) adds **one more query per node label and
+per relationship type** on top of that. None of this changes across the many questions of a
+benchmark run against the same database, so re-extracting it on every `run()` call — multiplied by
+every `cascade_mode` rung — is pure overhead that dominates wall-clock time once you're testing
+hundreds or thousands of questions.
+
+`cache_schema=True` (the **default**) caches the extracted schema per `(database, is_enhanced,
+sample)` and reuses it across every `run()` call made against the same graph instance — including
+every rung of `cascade_mode`, which used to (incorrectly) re-extract the full schema a second time
+for its `"full"` rung even within a single call; that's now fixed for free, cache or not. Only the
+extraction step is cached — the per-question filtering/pruning (`exact_match_prune`, `llm_prune`,
+`ie_prune`, ...) and every LLM call still happen for every question, so `cache_schema` cuts the
+technical schema-extraction overhead, not model cost:
+
+```python
+# same `database` (a Neo4jGraph instance, or an equivalent dict) reused across every question —
+# resolve it once yourself for the cache to actually kick in across the loop
+from text2cypher_composer import resolve_database  # or build a Neo4jGraph directly
+
+graph = resolve_database({})  # falls back to the NEO4J_* environment variables
+
+for question in questions:  # e.g. 2500 rows of a benchmark
+    result = run(
+        input_NL=question,
+        model="gpt-4o",
+        database=graph,       # the same instance every time
+        technique="Schema",
+        schema_mode="exact_match",
+        cascade_mode=True,
+        # cache_schema=True is the default — nothing else to pass
+    )
+```
+
+`evaluate_technique` (see "Bulk evaluation" below) already resolves `database` once and reuses it
+for every question/attempt, so it benefits automatically; calling `run()` yourself in a loop only
+benefits if you likewise resolve `database` into a single `Neo4jGraph` once and pass that same
+instance every time — passing a dict on every call still reconnects and (without this) re-extracts
+the schema every time.
+
+Pass `cache_schema=False` if your schema genuinely changes mid-experiment (e.g. you're writing to
+the graph between questions), or call `clear_schema_cache(graph)` — or `clear_schema_cache()` with
+no argument to drop every graph's cached schema — to invalidate an already-cached entry instead of
+disabling caching outright.
 
 ### `database`
 
@@ -422,6 +560,55 @@ top of the initial generation. If `tiktoken` isn't installed
 (`pip install "text2cypher-composer[dataset-tools]"`), each count is `None` instead of raising —
 `rescue_prompt_tokens` is then a list of `None`s the same length as `rescue_attempts`, not an
 empty list (it's only empty when `rescued` is `False`).
+
+### `self_verification` (requires `rescue_prompt` or `cascade_mode`)
+
+`rescue_prompt` and `cascade_mode` both decide whether to retry using purely mechanical checks:
+did the query fail to execute, come back empty, or fail CyVer's syntax check (`rescue.
+needs_rescue`)? None of that catches a query that runs cleanly, returns rows, and is
+syntactically valid, yet still doesn't answer what was actually asked — the wrong direction on a
+relationship, an aggregate over the wrong property, a filter that's subtly too broad/narrow, and
+so on. `self_verification=True` (default `False`) adds a **post-execution semantic check**: once
+an attempt looks mechanically fine, a model is asked to review the question, the generated
+`cypher`, and the rows it returned, and judge whether it actually answers the question. Often the
+same model that generated a query is able to catch its own mistake on a second look. A
+mechanically-broken attempt is retried as before, without spending a verification call on it — the
+semantic check only runs once mechanical checks already pass, and its verdict becomes the retry
+decision instead:
+
+```python
+result = run(
+    input_NL="...",
+    model="gpt-4o",
+    database={},
+    technique="vanilla",
+    rescue_prompt=True,       # or cascade_mode=True instead
+    self_verification=True,
+    # verification_model="gpt-5",            # optional -- defaults to reusing `model`
+    # verification_criteria="answer must include units",  # optional extra guidance
+)
+
+print(result.self_verification_passed)     # True/False, or None if never checked
+print(result.self_verification_reasoning)  # the model's explanation either way
+```
+
+Under `rescue_prompt`, a failed semantic verdict's reasoning also flows into the fix-up prompt's
+`error_message` (`rescue.build_error_message`'s `semantic_feedback`, appended as `"Semantic
+review: ..."`), so the model is actually told *why* its technically-valid query is being rejected.
+Under `cascade_mode`, a failed verdict at one rung falls through to the next exactly like a
+mechanical failure would, with no error context — consistent with `cascade_mode`'s existing
+"fresh prompt, not a fix-up" design.
+
+`verification_model` picks which model judges the query (any `model`-compatible value); it
+defaults to reusing the main generation `model` if omitted. `verification_criteria` is free-text
+extra evaluation guidance appended to the verification prompt, on top of "does this query answer
+the question".
+
+**Requires `rescue_prompt=True` or `cascade_mode=True`** — `run()` raises `ValueError` otherwise,
+since there would be no retry for a semantic verdict to inform; `verification_model`/
+`verification_criteria` are likewise rejected if passed without `self_verification=True`. Costs
+one extra LLM call per mechanically-valid attempt/rung, on top of whatever `rescue_prompt`/
+`cascade_mode` already cost.
 
 ### `dry_run`
 
@@ -757,8 +944,10 @@ text: since Neo4j doesn't guarantee row order without `ORDER BY`, rows are
 greedily bipartite-matched by similarity before being compared whenever the
 gold query has none.
 
-`evaluate_technique` also forwards `rescue_prompt`/`max_retries` (default `False`/`1`, same as
-`run()`) to every attempt.
+`evaluate_technique` also forwards `rescue_prompt`/`max_retries` (default `False`/`1`),
+`cache_schema` (default `True`), and `self_verification`/`verification_model`/
+`verification_criteria` (default `False`/`None`/`None`, requires `rescue_prompt=True`) — all same
+defaults as `run()` — to every attempt.
 
 Besides the metric/pass@j columns, `report.to_dataframe()` also carries, per question: any
 columns `gold_df` had beyond `question`/`query` (e.g. bio2C's `"ID"`/`"level"`, if you built

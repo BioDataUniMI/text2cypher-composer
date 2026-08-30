@@ -89,13 +89,17 @@ def build_error_message(
     result: Optional[List[Dict[str, Any]]],
     validation: CypherValidationReport,
     execution_error: Optional[str] = None,
+    semantic_feedback: Optional[str] = None,
 ) -> str:
     """Build a rescue `error_message` from every signal available about the failure.
 
     Concatenates, in order: the native Neo4j error (if the query didn't
     execute), an "empty result set" note if it executed but returned nothing,
-    and CyVer's validation report (both its warning-level notifications and
-    hard errors). Raw Neo4j notifications are left out: CyVer's schema/
+    CyVer's validation report (both its warning-level notifications and hard
+    errors), and `semantic_feedback` if given — the reasoning behind a failed
+    `self_verification` verdict (see `verification.verify_semantics`), for a
+    query that passed every mechanical check above yet still doesn't answer
+    the question. Raw Neo4j notifications are left out: CyVer's schema/
     properties validators already report the ones that matter (unknown
     labels/relationship-types/property-keys), so repeating them here would
     just spend tokens on duplicate information.
@@ -113,6 +117,8 @@ def build_error_message(
         formatted = _format_metadata(label, entries)
         if formatted:
             parts.append(formatted)
+    if semantic_feedback:
+        parts.append(f"Semantic review: {semantic_feedback}")
     if not parts:
         parts.append("The query did not return the expected result.")
     return "\n".join(parts)

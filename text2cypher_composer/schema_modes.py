@@ -27,6 +27,8 @@ from .schema import format_schema, get_schema, get_structured_schema
 from .techniques import (
     ALL_SCHEMA_COMPONENTS,
     CascadeModeLevel,
+    CascadeStrategy,
+    CascadeStrategyLike,
     DEFAULT_SCHEMA_COMPONENTS,
     SchemaComponent,
     SchemaComponentLike,
@@ -129,6 +131,58 @@ def _apply_selection(
         "relationships": pruned_relationships,
         "rel_props": pruned_rel_props,
         "metadata": structured_schema.get("metadata", {}),
+    }
+
+
+def _new_properties(new_props: List[Dict[str, Any]], old_props: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    old_names = {p.get("property") for p in old_props}
+    return [p for p in new_props if p.get("property") not in old_names]
+
+
+def _props_delta(
+    new: Dict[str, List[Dict[str, Any]]], old: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """A label/type -> properties mapping's delta: new labels/types whole, shared ones narrowed
+    to just the properties `old` didn't already have for them; a label/type with nothing new
+    (already fully present in `old`) is dropped entirely."""
+    delta: Dict[str, List[Dict[str, Any]]] = {}
+    for key, props in new.items():
+        if key not in old:
+            delta[key] = props
+        else:
+            new_props = _new_properties(props, old[key])
+            if new_props:
+                delta[key] = new_props
+    return delta
+
+
+def schema_delta(new: Dict[str, Any], old: Dict[str, Any]) -> Dict[str, Any]:
+    """The elements present in `new` but not already present in `old` — used by
+    `resolve_cascade_mode_levels`'s `strategy="delta"` (the "Incremental delta cascade") to show
+    each cascade rung only the schema it hasn't already shown at a previous rung, instead of
+    repeating everything seen so far.
+
+    A node/relationship label/type entirely absent from `old` is included whole; one present in
+    both keeps only the properties `old` didn't already list for it (so a label narrowed in `old`
+    and widened in `new` contributes only its *new* properties, not the whole label again — see
+    `_props_delta`); a label/type identical in both (nothing new) is dropped entirely.
+    Relationships are a set difference on `(start, type, end)`. Same `{node_props, relationships,
+    rel_props, metadata}` shape `_apply_selection`/`format_schema` already operate on.
+    """
+    old_relationship_keys = {
+        (r.get("start"), r.get("type"), r.get("end")) for r in (old.get("relationships") or [])
+    }
+    delta_relationships = [
+        r
+        for r in (new.get("relationships") or [])
+        if (r.get("start"), r.get("type"), r.get("end")) not in old_relationship_keys
+    ]
+
+    return {
+        "node_props": _props_delta(new.get("node_props") or {}, old.get("node_props") or {}),
+        "relationships": delta_relationships,
+        "rel_props": _props_delta(new.get("rel_props") or {}, old.get("rel_props") or {}),
+        "metadata": new.get("metadata", {}),
     }
 
 
@@ -492,22 +546,24 @@ def resolve_schema_text(
     similarity_threshold: float = 0.5,
     schema_components: Iterable[SchemaComponentLike] = DEFAULT_SCHEMA_COMPONENTS,
     ie_engine: Optional[Any] = None,
+    cache_schema: bool = True,
 ) -> str:
     """Compute the schema text to place in the prompt, per `mode` (see `SchemaMode`).
 
     `schema_components` is only used by `mode="exact_match"`/`"ner_exact_match"`/
-    `"ie_extraction"` (see `SchemaComponent`); ignored otherwise.
+    `"ie_extraction"` (see `SchemaComponent`); ignored otherwise. `cache_schema`
+    is forwarded to `get_schema`/`get_structured_schema` — see their docstrings.
     """
     mode = SchemaMode(mode)
 
     if mode == SchemaMode.SCHEMA:
-        return get_schema(graph, is_enhanced=False)
+        return get_schema(graph, is_enhanced=False, cache_schema=cache_schema)
 
     if mode == SchemaMode.ENHANCED:
-        return get_schema(graph, is_enhanced=True)
+        return get_schema(graph, is_enhanced=True, cache_schema=cache_schema)
 
     if mode == SchemaMode.EXACT_MATCH:
-        structured = get_structured_schema(graph, is_enhanced=True)
+        structured = get_structured_schema(graph, is_enhanced=True, cache_schema=cache_schema)
         return format_schema(
             exact_match_prune(structured, question, components=schema_components), is_enhanced=True
         )
@@ -518,7 +574,7 @@ def resolve_schema_text(
                 "schema_mode='ner_exact_match' requires an `nlp` argument: a loaded NLP "
                 "pipeline with named-entity recognition (e.g. spaCy's en_ner_bionlp13cg_md)."
             )
-        structured = get_structured_schema(graph, is_enhanced=True)
+        structured = get_structured_schema(graph, is_enhanced=True, cache_schema=cache_schema)
         return format_schema(
             ner_exact_match_prune(structured, question, nlp, components=schema_components), is_enhanced=True
         )
@@ -529,7 +585,7 @@ def resolve_schema_text(
                 "schema_mode='similarity' requires an `nlp` argument: a loaded NLP pipeline "
                 "with word vectors (e.g. spaCy's en_core_web_md)."
             )
-        structured = get_structured_schema(graph, is_enhanced=False)
+        structured = get_structured_schema(graph, is_enhanced=False, cache_schema=cache_schema)
         return format_schema(
             similarity_prune(structured, question, nlp, threshold=similarity_threshold), is_enhanced=False
         )
@@ -537,7 +593,7 @@ def resolve_schema_text(
     if mode == SchemaMode.LLM_PRUNING:
         if llm is None:
             raise ValueError("schema_mode='llm_pruning' requires a structured-output-capable model.")
-        structured = get_structured_schema(graph, is_enhanced=True)
+        structured = get_structured_schema(graph, is_enhanced=True, cache_schema=cache_schema)
         return format_schema(llm_prune(structured, question, llm), is_enhanced=True)
 
     if mode == SchemaMode.IE_EXTRACTION:
@@ -549,7 +605,7 @@ def resolve_schema_text(
                 "backed by the real schemalink-engine package (pip install schemalink-engine), "
                 "or see `ie_prune` for the contract to implement your own."
             )
-        structured = get_structured_schema(graph, is_enhanced=True)
+        structured = get_structured_schema(graph, is_enhanced=True, cache_schema=cache_schema)
         return format_schema(
             ie_prune(structured, question, ie_engine, components=schema_components), is_enhanced=True
         )
@@ -566,6 +622,8 @@ def resolve_cascade_mode_levels(
     similarity_threshold: float = 0.5,
     ie_engine: Optional[Any] = None,
     skip_narrow: bool = False,
+    cache_schema: bool = True,
+    strategy: CascadeStrategyLike = CascadeStrategy.STANDARD,
 ) -> List[Tuple[CascadeModeLevel, str]]:
     """Resolve the schema text for each rung of the `cascade_mode` cascade, in order.
 
@@ -576,7 +634,9 @@ def resolve_cascade_mode_levels(
     `CascadeModeLevel.NODES_ONLY` (only node labels matched —
     `DEFAULT_SCHEMA_COMPONENTS`; relationships kept via shared endpoints,
     every property of a selected label/type kept), then always
-    `CascadeModeLevel.FULL` last (the unpruned schema).
+    `CascadeModeLevel.FULL` last (the unpruned schema — built by re-formatting
+    the same `structured` schema already fetched above for the other rungs,
+    not a second Neo4j round-trip).
 
     `mode` must be a pruning schema_mode — `"exact_match"`,
     `"ner_exact_match"`, `"similarity"`, `"llm_pruning"`, or
@@ -584,8 +644,21 @@ def resolve_cascade_mode_levels(
     raise `ValueError`, same as passing `cascade_mode=True` for a
     non-schema technique would in `run()`. `llm`/`nlp`/`ie_engine` are
     required by the same modes `resolve_schema_text` requires them for.
+    `cache_schema` is forwarded to `get_structured_schema` — see its
+    docstring.
+
+    `strategy` (default `CascadeStrategy.STANDARD`) controls what each rung's
+    `schema_text` actually contains: `STANDARD` formats each rung's full
+    structured schema, independently of the others (today's behavior).
+    `DELTA` (the "Incremental delta cascade") instead formats only the
+    *first* rung in full — every rung after that gets `schema_delta(this
+    rung's structured schema, the previous rung's)`, i.e. only the elements
+    not already shown at a previous rung. The rung *selection* itself
+    (narrow/nodes_only/full) is identical either way; only the formatting
+    differs.
     """
     mode = SchemaMode(mode)
+    strategy = CascadeStrategy(strategy)
     if mode in (SchemaMode.SCHEMA, SchemaMode.ENHANCED):
         raise ValueError(
             f"schema_mode='{mode.value}' has nothing to prune — cascade_mode requires a "
@@ -600,9 +673,9 @@ def resolve_cascade_mode_levels(
         raise ValueError("schema_mode='ie_extraction' requires an `ie_engine` argument.")
 
     is_enhanced = mode != SchemaMode.SIMILARITY
-    structured = get_structured_schema(graph, is_enhanced=is_enhanced)
+    structured = get_structured_schema(graph, is_enhanced=is_enhanced, cache_schema=cache_schema)
 
-    levels: List[Tuple[CascadeModeLevel, str]] = []
+    structured_levels: List[Tuple[CascadeModeLevel, Dict[str, Any]]] = []
 
     if not skip_narrow:
         if mode == SchemaMode.EXACT_MATCH:
@@ -615,7 +688,7 @@ def resolve_cascade_mode_levels(
             narrow = llm_prune(structured, question, llm)
         else:  # IE_EXTRACTION
             narrow = ie_prune(structured, question, ie_engine, components=ALL_SCHEMA_COMPONENTS)
-        levels.append((CascadeModeLevel.NARROW, format_schema(narrow, is_enhanced=is_enhanced)))
+        structured_levels.append((CascadeModeLevel.NARROW, narrow))
 
     if mode == SchemaMode.EXACT_MATCH:
         nodes_only = exact_match_prune(structured, question, components=DEFAULT_SCHEMA_COMPONENTS)
@@ -627,8 +700,18 @@ def resolve_cascade_mode_levels(
         nodes_only = llm_prune_nodes_only(structured, question, llm)
     else:  # IE_EXTRACTION
         nodes_only = ie_prune(structured, question, ie_engine, components=DEFAULT_SCHEMA_COMPONENTS)
-    levels.append((CascadeModeLevel.NODES_ONLY, format_schema(nodes_only, is_enhanced=is_enhanced)))
+    structured_levels.append((CascadeModeLevel.NODES_ONLY, nodes_only))
 
-    levels.append((CascadeModeLevel.FULL, get_schema(graph, is_enhanced=is_enhanced)))
+    structured_levels.append((CascadeModeLevel.FULL, structured))
+
+    levels: List[Tuple[CascadeModeLevel, str]] = []
+    previous_structured: Optional[Dict[str, Any]] = None
+    for level, level_structured in structured_levels:
+        if strategy == CascadeStrategy.DELTA and previous_structured is not None:
+            text = format_schema(schema_delta(level_structured, previous_structured), is_enhanced=is_enhanced)
+        else:
+            text = format_schema(level_structured, is_enhanced=is_enhanced)
+        levels.append((level, text))
+        previous_structured = level_structured
 
     return levels

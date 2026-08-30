@@ -34,7 +34,10 @@ class QuestionEvaluation:
     attempt's (see `Text2CypherResult`) — the `rescue_*` ones are only
     meaningful when `evaluate_technique` was called with `rescue_prompt=True`;
     `execution_error`/`execution_warnings`/`prompt_tokens` are populated
-    regardless.
+    regardless. `self_verification_passed`/`self_verification_reasoning`
+    likewise proxy the first attempt's, only meaningful when
+    `evaluate_technique` was called with `self_verification=True` (`None`
+    otherwise, or if the first attempt was already mechanically broken).
     """
 
     question: str
@@ -83,6 +86,14 @@ class QuestionEvaluation:
     def prompt_tokens(self) -> Optional[int]:
         return self.attempts[0].prompt_tokens
 
+    @property
+    def self_verification_passed(self) -> Optional[bool]:
+        return self.attempts[0].self_verification_passed
+
+    @property
+    def self_verification_reasoning(self) -> Optional[str]:
+        return self.attempts[0].self_verification_reasoning
+
 
 @dataclass
 class EvaluationSummary:
@@ -123,9 +134,14 @@ class EvaluationReport:
         `error_message`/fully-instantiated messages sent for each retry) and
         `rescue_prompt_tokens` (their token counts — a list of
         `rescue_attempts` numbers, handy for tallying how many extra tokens
-        `rescue_prompt` costs); and `retrieved_example_ids`/
-        `retrieved_example_distances` for RAG techniques (`None` otherwise) —
-        see `Text2CypherResult.retrieved_examples`.
+        `rescue_prompt` costs); `self_verification_passed`/
+        `self_verification_reasoning` (the first attempt's semantic verdict
+        and its reasoning, when `evaluate_technique` was called with
+        `self_verification=True` — both `None` otherwise, or if the first
+        attempt was already mechanically broken); and
+        `retrieved_example_ids`/`retrieved_example_distances` for RAG
+        techniques (`None` otherwise) — see
+        `Text2CypherResult.retrieved_examples`.
         """
         k = self.summary.k
         rows = []
@@ -157,6 +173,8 @@ class EvaluationReport:
             row["rescue_error_messages"] = first.rescue_error_messages
             row["rescue_prompts"] = first.rescue_prompts
             row["rescue_prompt_tokens"] = first.rescue_prompt_tokens
+            row["self_verification_passed"] = first.self_verification_passed
+            row["self_verification_reasoning"] = first.self_verification_reasoning
             row["retrieved_example_ids"] = retrieved.get("example_ids")
             row["retrieved_example_distances"] = retrieved.get("example_distances")
             rows.append(row)
@@ -172,6 +190,10 @@ def evaluate_technique(
     k: int = 1,
     rescue_prompt: bool = False,
     max_retries: int = 1,
+    cache_schema: bool = True,
+    self_verification: bool = False,
+    verification_model: Optional[ModelLike] = None,
+    verification_criteria: Optional[str] = None,
 ) -> EvaluationReport:
     """Evaluate `technique` in bulk over a gold (question, query) test set.
 
@@ -205,6 +227,20 @@ def evaluate_technique(
             in `to_dataframe()`) report, per question, whether and how many
             retries the *first* attempt needed to stop failing/coming back
             empty.
+        cache_schema: forwarded to `run()` for every attempt (default
+            `True`) — for a schema-using `technique`, caches the schema
+            extracted from `database` and reuses it across every question/
+            attempt in this evaluation instead of re-extracting it from
+            Neo4j each time (extraction is a fixed cost that doesn't change
+            across a gold set evaluated against the same database). See
+            `run()`'s `cache_schema` for details.
+        self_verification, verification_model, verification_criteria:
+            forwarded to `run()` for every attempt (default `False`/`None`/
+            `None`) — requires `rescue_prompt=True`. Reviews each
+            mechanically-valid attempt with a model judging whether it
+            actually answers the question, folding a failed verdict into
+            the same retry decision `rescue_prompt` already makes. See
+            `run()`'s `self_verification` for details.
 
     Returns:
         An EvaluationReport: a dataset-level `summary` (mean metrics plus
@@ -240,6 +276,10 @@ def evaluate_technique(
                 dataset=dataset,
                 rescue_prompt=rescue_prompt,
                 max_retries=max_retries,
+                cache_schema=cache_schema,
+                self_verification=self_verification,
+                verification_model=verification_model,
+                verification_criteria=verification_criteria,
             )
             attempts.append(result)
             pred_data = result.result if result.executed else []

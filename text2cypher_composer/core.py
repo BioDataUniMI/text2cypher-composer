@@ -10,11 +10,13 @@ from .cypher_utils import CypherExecutionError, execute_cypher_with_warnings, no
 from .graph_db import DatabaseLike, resolve_database
 from .llm import ModelLike, resolve_model, resolve_pruning_model
 from .prompts import messages_for
-from .rag import RAGDataset
+from .rag import RAGDataset, resolve_adaptive_rag_levels
 from .rescue import build_error_message, needs_rescue, rescue_messages
 from .schema_modes import resolve_cascade_mode_levels, resolve_schema_text
 from .tokens import count_message_tokens
 from .techniques import (
+    CascadeStrategy,
+    CascadeStrategyLike,
     DEFAULT_SCHEMA_COMPONENTS,
     RAG_TECHNIQUES,
     SCHEMA_TECHNIQUES,
@@ -25,6 +27,7 @@ from .techniques import (
     Technique,
 )
 from .validation import CypherValidationReport, validate_cypher
+from .verification import SemanticVerification, verify_semantics
 
 DatasetLike = Union[RAGDataset, str]
 
@@ -78,6 +81,25 @@ class Text2CypherResult:
     same order, from most to least pruned), that rung's initial
     fully-instantiated prompt and its token count — both empty if
     `cascade_mode` wasn't used.
+
+    `adaptive_rag_level`/`adaptive_rag_attempts`/`adaptive_rag_prompts`/
+    `adaptive_rag_prompt_tokens` are the RAG-side siblings of the
+    `cascade_mode_*` fields above, populated instead when `adaptive_rag=True`
+    was used (`cascade_mode` and `adaptive_rag` are mutually exclusive, so
+    only one set is ever non-empty): `adaptive_rag_level` is which rung of
+    the `adaptive_rag` cascade — `"minimal"`, `"moderate"`, or `"full"` —
+    the returned `cypher`/`result`/etc. came from; `adaptive_rag_attempts`
+    is how many rungs were tried (1..3); `adaptive_rag_prompts`/
+    `adaptive_rag_prompt_tokens` hold, one entry per rung tried (from fewest
+    to most retrieved examples), that rung's initial fully-instantiated
+    prompt and its token count.
+
+    `self_verification_passed`/`self_verification_reasoning` hold, for the
+    final returned attempt only, whether `self_verification` (see `run()`)
+    judged `cypher` to actually answer `question`, and why — both `None` if
+    `self_verification` wasn't used, or if the final attempt was already
+    mechanically broken (`rescue.needs_rescue`), since there's no point
+    asking for a semantic verdict on a query that doesn't even execute.
     """
 
     question: str
@@ -104,6 +126,12 @@ class Text2CypherResult:
     cascade_mode_attempts: int = 0
     cascade_mode_prompts: List[List[Dict[str, str]]] = field(default_factory=list)
     cascade_mode_prompt_tokens: List[Optional[int]] = field(default_factory=list)
+    adaptive_rag_level: Optional[str] = None
+    adaptive_rag_attempts: int = 0
+    adaptive_rag_prompts: List[List[Dict[str, str]]] = field(default_factory=list)
+    adaptive_rag_prompt_tokens: List[Optional[int]] = field(default_factory=list)
+    self_verification_passed: Optional[bool] = None
+    self_verification_reasoning: Optional[str] = None
 
 
 def _resolve_dataset(dataset: DatasetLike) -> RAGDataset:
@@ -140,27 +168,78 @@ class _AttemptResult:
     rescue_error_messages: List[str]
     rescue_prompts: List[List[Dict[str, str]]]
     rescue_prompt_tokens: List[Optional[int]]
+    needs_retry: bool
+    self_verification_passed: Optional[bool]
+    self_verification_reasoning: Optional[str]
 
 
-def _generate_execute_and_rescue(
-    llm: Any,
+def _needs_retry(
+    executed: bool,
+    result: Optional[List[Dict[str, Any]]],
+    validation: CypherValidationReport,
+    question: str,
+    cypher: str,
+    self_verification: bool,
+    verification_llm: Optional[Any],
+    verification_criteria: Optional[str],
+) -> "tuple[bool, Optional[SemanticVerification]]":
+    """Whether an attempt still needs a retry — mechanical checks first, semantic ones only if those pass.
+
+    `rescue.needs_rescue` alone decides this when `self_verification` is
+    off. When it's on, a query that already needs_rescue mechanically
+    short-circuits (no point spending a verification call on a query that
+    doesn't even execute); otherwise `verify_semantics` is asked whether the
+    query actually answers `question`, and its verdict becomes the retry
+    decision instead.
+    """
+    if needs_rescue(executed, result, validation):
+        return True, None
+    if not self_verification:
+        return False, None
+    verification = verify_semantics(verification_llm, question, cypher, result, criteria=verification_criteria)
+    return not verification.answers_question, verification
+
+
+@dataclass
+class _OneAttempt:
+    """One single generation+execute+validate+retry-check shot from a given prompt/kwargs pair.
+
+    The building block both `_generate_execute_and_rescue` (its initial attempt, and each
+    `rescue_prompt` retry) and the `cascade_mode` `strategy="delta"` loop in `run()` are built
+    from — factored out so both share the exact same generate/execute/validate/`_needs_retry`
+    logic instead of duplicating it.
+    """
+
+    cypher: str
+    prompt_messages: List[Dict[str, str]]
+    prompt_tokens: Optional[int]
+    executed: bool
+    result: Optional[List[Dict[str, Any]]]
+    validation: CypherValidationReport
+    execution_error: Optional[str]
+    execution_warnings: List[str]
+    retry_needed: bool
+    verification: Optional[SemanticVerification]
+
+
+def _generate_once(
     prompt_template: ChatPromptTemplate,
     format_kwargs: Dict[str, Any],
+    llm: Any,
     model_name: str,
     graph: Any,
-    uses_schema: bool,
-    uses_rag: bool,
-    rescue_prompt: bool,
-    max_retries: int,
-) -> _AttemptResult:
-    """Generate a Cypher query from `format_kwargs`, run it, and rescue it if asked to."""
+    question: str,
+    self_verification: bool,
+    verification_llm: Optional[Any],
+    verification_criteria: Optional[str],
+) -> _OneAttempt:
+    """Format `prompt_template` with `format_kwargs`, generate, execute, validate, and check retry."""
     formatted_messages = prompt_template.format_messages(**format_kwargs)
     prompt_messages = [{"role": m.type, "content": m.content} for m in formatted_messages]
     prompt_tokens = count_message_tokens(prompt_messages, model_name)
 
     chain = prompt_template | llm | StrOutputParser()
     cypher = normalize_generated_cypher(chain.invoke(format_kwargs))
-    initial_cypher = cypher
 
     validation = validate_cypher(graph, cypher)
     execution_error: Optional[str] = None
@@ -174,38 +253,83 @@ def _generate_execute_and_rescue(
         execution_error = f"{e.code}: {e.message}"
         execution_warnings = e.warnings
 
+    retry_needed, verification = _needs_retry(
+        executed, result, validation, question, cypher, self_verification, verification_llm, verification_criteria
+    )
+
+    return _OneAttempt(
+        cypher=cypher,
+        prompt_messages=prompt_messages,
+        prompt_tokens=prompt_tokens,
+        executed=executed,
+        result=result,
+        validation=validation,
+        execution_error=execution_error,
+        execution_warnings=execution_warnings,
+        retry_needed=retry_needed,
+        verification=verification,
+    )
+
+
+def _generate_execute_and_rescue(
+    llm: Any,
+    prompt_template: ChatPromptTemplate,
+    format_kwargs: Dict[str, Any],
+    model_name: str,
+    graph: Any,
+    uses_schema: bool,
+    uses_rag: bool,
+    rescue_prompt: bool,
+    max_retries: int,
+    self_verification: bool = False,
+    verification_llm: Optional[Any] = None,
+    verification_criteria: Optional[str] = None,
+) -> _AttemptResult:
+    """Generate a Cypher query from `format_kwargs`, run it, and rescue it if asked to."""
+    question = format_kwargs["question"]
+    first = _generate_once(
+        prompt_template, format_kwargs, llm, model_name, graph, question,
+        self_verification, verification_llm, verification_criteria,
+    )
+    initial_cypher = first.cypher
+    cypher = first.cypher
+    prompt_messages = first.prompt_messages
+    prompt_tokens = first.prompt_tokens
+    executed, result, validation = first.executed, first.result, first.validation
+    execution_error, execution_warnings = first.execution_error, first.execution_warnings
+    retry_needed, verification = first.retry_needed, first.verification
+
     rescue_attempts = 0
     rescue_error_messages: List[str] = []
     rescue_prompts: List[List[Dict[str, str]]] = []
     rescue_prompt_tokens: List[Optional[int]] = []
-    if rescue_prompt and needs_rescue(executed, result, validation):
+    if rescue_prompt and retry_needed:
         rescue_prompt_template = ChatPromptTemplate.from_messages(rescue_messages(uses_schema, uses_rag))
-        rescue_generation = llm | StrOutputParser()
         for _ in range(max_retries):
             rescue_attempts += 1
-            error_message = build_error_message(executed, result, validation, execution_error)
+            semantic_feedback = (
+                verification.reasoning if verification and not verification.answers_question else None
+            )
+            error_message = build_error_message(
+                executed, result, validation, execution_error, semantic_feedback=semantic_feedback
+            )
             rescue_error_messages.append(error_message)
             rescue_kwargs = {
                 **format_kwargs,
                 "query": cypher,
                 "error_message": error_message,
             }
-            formatted_rescue_messages = rescue_prompt_template.format_messages(**rescue_kwargs)
-            rescue_prompt_dicts = [{"role": m.type, "content": m.content} for m in formatted_rescue_messages]
-            rescue_prompts.append(rescue_prompt_dicts)
-            rescue_prompt_tokens.append(count_message_tokens(rescue_prompt_dicts, model_name))
-            cypher = normalize_generated_cypher(rescue_generation.invoke(formatted_rescue_messages))
-            validation = validate_cypher(graph, cypher)
-            try:
-                result, execution_warnings = execute_cypher_with_warnings(graph, cypher)
-                executed = True
-                execution_error = None
-            except CypherExecutionError as e:
-                result = None
-                executed = False
-                execution_error = f"{e.code}: {e.message}"
-                execution_warnings = e.warnings
-            if not needs_rescue(executed, result, validation):
+            attempt = _generate_once(
+                rescue_prompt_template, rescue_kwargs, llm, model_name, graph, question,
+                self_verification, verification_llm, verification_criteria,
+            )
+            rescue_prompts.append(attempt.prompt_messages)
+            rescue_prompt_tokens.append(attempt.prompt_tokens)
+            cypher = attempt.cypher
+            executed, result, validation = attempt.executed, attempt.result, attempt.validation
+            execution_error, execution_warnings = attempt.execution_error, attempt.execution_warnings
+            retry_needed, verification = attempt.retry_needed, attempt.verification
+            if not retry_needed:
                 break
 
     return _AttemptResult(
@@ -222,6 +346,9 @@ def _generate_execute_and_rescue(
         rescue_error_messages=rescue_error_messages,
         rescue_prompts=rescue_prompts,
         rescue_prompt_tokens=rescue_prompt_tokens,
+        needs_retry=retry_needed,
+        self_verification_passed=verification.answers_question if verification else None,
+        self_verification_reasoning=verification.reasoning if verification else None,
     )
 
 
@@ -240,6 +367,12 @@ def run(
     max_retries: int = 1,
     cascade_mode: bool = False,
     skip_narrow_schema_filter: bool = False,
+    cascade_strategy: CascadeStrategyLike = CascadeStrategy.STANDARD,
+    adaptive_rag: bool = False,
+    cache_schema: bool = True,
+    self_verification: bool = False,
+    verification_model: Optional[ModelLike] = None,
+    verification_criteria: Optional[str] = None,
     dry_run: bool = False,
 ) -> Text2CypherResult:
     """Translate a natural-language question into Cypher and run it.
@@ -318,16 +451,97 @@ def run(
         skip_narrow_schema_filter: if True, skip the "narrow" rung and start
             the `cascade_mode` cascade directly at "nodes_only". Requires
             `cascade_mode=True`.
+        cascade_strategy: how `cascade_mode`'s rungs are prompted — `"standard"`
+            (default) sends each rung as a fresh, self-contained prompt
+            carrying that rung's *entire* schema, same as if `cascade_mode`
+            were used alone. `"delta"` — the "Incremental delta cascade" —
+            keeps this fresh-prompt behavior only for the first rung
+            ("narrow"); every rung after that instead reuses
+            `rescue_prompt`'s error-aware fix-up mechanics (the previous
+            rung's generated query, plus why it needed to move on) but shows
+            only the schema elements newly introduced at this rung (see
+            `schema_modes.schema_delta`), not the ones already shown at a
+            previous rung — cutting redundant schema tokens repeated across
+            rungs, at the cost of each rung after the first depending on the
+            previous rung's output rather than being independent. Requires
+            `cascade_mode=True` — `run()` raises `ValueError` if
+            `cascade_strategy="delta"` is passed with `cascade_mode=False`.
+        adaptive_rag: if True, an attempt that fails to execute or comes
+            back empty is retried from scratch (a fresh prompt, not
+            `rescue_prompt`'s error-aware fix-up) with progressively more
+            retrieved RAG examples — the RAG-side sibling of `cascade_mode`,
+            but expanding retrieved context instead of un-pruning the
+            schema: first a single example ("minimal"), then the dataset's
+            configured `n_results` ("moderate"), then finally every example
+            in the collection ("full"). Stops early once one rung succeeds.
+            Mutually exclusive with `cascade_mode`, `rescue_prompt`, and a
+            non-default `max_retries` — `run()` raises `ValueError` if
+            `adaptive_rag=True` is combined with any of those; pick one
+            retry strategy, not several. Only meaningful — and only
+            allowed — for a RAG-using `technique` ("RAG", "RAG+O",
+            "Schema+RAG", "Schema+RAG+O"). See `result.adaptive_rag_level`,
+            `result.adaptive_rag_attempts`, `result.adaptive_rag_prompts`,
+            and `result.adaptive_rag_prompt_tokens`.
+        cache_schema: if True (the default), the graph schema extracted from
+            Neo4j for `technique`s that use the schema is cached per
+            `(database, schema_mode's is_enhanced, sample)` and reused across
+            `run()` calls against the same graph — see
+            `schema.get_structured_schema`. Extracting a schema is a fixed
+            cost that doesn't change across the many questions of a
+            benchmark run against the same database, so re-extracting it on
+            every call (multiplied by every `cascade_mode` rung) is pure
+            overhead; the cache only covers this extraction step, not the
+            per-question filtering/pruning, and it never reduces LLM call
+            cost. Pass `False` to always re-extract (e.g. if the schema
+            legitimately changes mid-experiment), or see
+            `clear_schema_cache` to invalidate an already-cached entry
+            instead. Ignored (harmlessly) for a `technique` that doesn't use
+            the schema.
+        self_verification: if True, an attempt that mechanically looks fine
+            (executed, non-empty, syntactically valid — i.e. `rescue.
+            needs_rescue` says no rescue is needed) is additionally reviewed
+            by a model: given the question, the generated `cypher`, and the
+            rows it returned, is this actually the right query? A query can
+            run cleanly and still not answer what was asked (wrong
+            direction on a relationship, an aggregate over the wrong
+            property, too broad/narrow a filter, ...) — this is a different,
+            orthogonal signal from CyVer's mechanical checks, not a
+            replacement for them: a mechanically-broken attempt is retried
+            without spending a verification call on it. A failed verdict is
+            folded into the same retry decision `rescue_prompt`/
+            `cascade_mode` already make — under `rescue_prompt`, the
+            verdict's reasoning is also fed into the fix-up prompt's
+            `error_message` (see `rescue.build_error_message`'s
+            `semantic_feedback`); under `cascade_mode`, a failed verdict at
+            one rung falls through to the next exactly like a mechanical
+            failure would, with no error context (consistent with
+            `cascade_mode`'s "fresh prompt, not a fix-up" design). Requires
+            `rescue_prompt=True` or `cascade_mode=True` — `run()` raises
+            `ValueError` otherwise, since there would be no retry to inform.
+            Costs one extra LLM call per mechanically-valid attempt/rung.
+            See `result.self_verification_passed`/
+            `result.self_verification_reasoning`.
+        verification_model: which model judges `self_verification` — an
+            OpenAI/Anthropic/Google/DeepSeek model id or a LangChain-
+            compatible chat model / Runnable, same as `model`. Defaults to
+            reusing `model` itself if omitted. Ignored (and rejected with
+            `ValueError` if passed) when `self_verification` is False.
+        verification_criteria: free-text extra evaluation guidance appended
+            to the verification prompt (e.g. "the answer must include
+            units"), on top of "does this query answer the question".
+            Ignored (and rejected with `ValueError` if passed) when
+            `self_verification` is False.
         dry_run: if True, build and return the fully-instantiated `prompt`
             (schema resolved, RAG examples retrieved, exactly as it would be
             for a real call) but stop there — no generation call, no Cypher
             execution, no CyVer validation, no rescue. `cypher`,
             `initial_cypher`, `result`, and `validation` are all `None`, and
-            `executed` is `False`. Incompatible with `rescue_prompt=True` or
-            `cascade_mode=True` (there's nothing generated to rescue/fall
-            back from). `prompt_tokens` is still computed, so `dry_run` is
-            enough to compare prompt token counts across `technique`/
-            `schema_mode` without spending a generation call.
+            `executed` is `False`. Incompatible with `rescue_prompt=True`,
+            `cascade_mode=True`, or `adaptive_rag=True` (there's nothing
+            generated to rescue/fall back from). `prompt_tokens` is still
+            computed, so `dry_run` is enough to compare prompt token counts
+            across `technique`/`schema_mode` without spending a generation
+            call.
 
     Returns:
         A Text2CypherResult. `prompt` holds the fully-instantiated messages
@@ -351,9 +565,20 @@ def run(
         how many rungs were tried, and `cascade_mode_prompts`/
         `cascade_mode_prompt_tokens` list, one per rung tried, that
         rung's initial prompt/token count — all default to `None`/`0`/`[]`
-        if `cascade_mode` wasn't used. If `dry_run` is True, only
-        `prompt` (`prompt_tokens`, and `schema`/`retrieved_examples`, if
-        applicable) are populated.
+        if `cascade_mode` wasn't used. Under `cascade_strategy="delta"`,
+        `schema` holds only the *delta* text actually shown at the winning
+        rung (not the cumulative schema up to it) — the rest of what that
+        rung's model call saw (the previous rung's query, why it needed to
+        move on) is visible in `prompt` instead. If `adaptive_rag` was used instead,
+        `adaptive_rag_level`/`adaptive_rag_attempts`/`adaptive_rag_prompts`/
+        `adaptive_rag_prompt_tokens` are the same shape, one rung per
+        retrieved-example count tried ("minimal"/"moderate"/"full") instead
+        of one per schema pruning level. If `self_verification` was used,
+        `self_verification_passed`/`self_verification_reasoning` report the
+        final attempt's semantic verdict — both `None` if it wasn't used, or
+        if the final attempt was already mechanically broken. If `dry_run`
+        is True, only `prompt` (`prompt_tokens`, and `schema`/
+        `retrieved_examples`, if applicable) are populated.
     """
     technique = Technique(technique)
     uses_rag = technique in RAG_TECHNIQUES
@@ -376,6 +601,8 @@ def run(
         raise ValueError(f"`cascade_mode` requires technique='{technique.value}' to use the schema.")
     if skip_narrow_schema_filter and not cascade_mode:
         raise ValueError("`skip_narrow_schema_filter` requires `cascade_mode=True`.")
+    if CascadeStrategy(cascade_strategy) != CascadeStrategy.STANDARD and not cascade_mode:
+        raise ValueError("`cascade_strategy` other than 'standard' requires `cascade_mode=True`.")
     if dry_run and cascade_mode:
         raise ValueError(
             "`dry_run` and `cascade_mode` are incompatible: dry_run generates nothing to fall back from."
@@ -398,10 +625,43 @@ def run(
             "similarity, llm_pruning, or ie_extraction) — 'schema'/'enhanced' have nothing to "
             "prune from."
         )
+    if adaptive_rag and not uses_rag:
+        raise ValueError(f"`adaptive_rag` requires technique='{technique.value}' to use RAG.")
+    if dry_run and adaptive_rag:
+        raise ValueError(
+            "`dry_run` and `adaptive_rag` are incompatible: dry_run generates nothing to fall back from."
+        )
+    if adaptive_rag and rescue_prompt:
+        raise ValueError(
+            "`adaptive_rag` and `rescue_prompt` are mutually exclusive: pick one retry strategy, not both."
+        )
+    if adaptive_rag and max_retries != 1:
+        raise ValueError(
+            "`adaptive_rag` and `max_retries` are mutually exclusive (max_retries only applies to "
+            "rescue_prompt): pick one retry strategy, not both."
+        )
+    if adaptive_rag and cascade_mode:
+        raise ValueError(
+            "`adaptive_rag` and `cascade_mode` are mutually exclusive: pick one retry strategy, not both."
+        )
+    if self_verification and not (rescue_prompt or cascade_mode):
+        raise ValueError(
+            "`self_verification` requires `rescue_prompt=True` or `cascade_mode=True` — there "
+            "would otherwise be no retry for its verdict to inform."
+        )
+    if not self_verification and (verification_model is not None or verification_criteria is not None):
+        raise ValueError(
+            "`verification_model`/`verification_criteria` were provided but `self_verification` "
+            "is False."
+        )
+    cascade_strategy = CascadeStrategy(cascade_strategy)
 
     graph = resolve_database(database)
     llm = resolve_model(model)
     model_name = model if isinstance(model, str) else type(model).__name__
+    verification_llm = None
+    if self_verification:
+        verification_llm = resolve_pruning_model(verification_model if verification_model is not None else model)
 
     schema_text = None
     schema_levels = None
@@ -418,6 +678,8 @@ def run(
                 similarity_threshold=similarity_threshold,
                 ie_engine=ie_engine,
                 skip_narrow=skip_narrow_schema_filter,
+                cache_schema=cache_schema,
+                strategy=cascade_strategy,
             )
             schema_text = schema_levels[0][1]
         else:
@@ -430,17 +692,23 @@ def run(
                 similarity_threshold=similarity_threshold,
                 schema_components=schema_components,
                 ie_engine=ie_engine,
+                cache_schema=cache_schema,
             )
 
     retrieved = None
+    rag_levels = None
     format_kwargs: Dict[str, Any] = {"question": input_NL}
     if uses_schema and not cascade_mode:
         format_kwargs["enhanced_schema"] = schema_text
     if uses_rag:
         rag_dataset = _resolve_dataset(dataset)
         with_output = technique in OUTPUT_AUGMENTED_TECHNIQUES
-        retrieved = rag_dataset.retrieve_examples(input_NL, with_output=with_output)
-        format_kwargs["examples"] = retrieved["examples_text"]
+        if adaptive_rag:
+            rag_levels = resolve_adaptive_rag_levels(rag_dataset, input_NL, with_output)
+            retrieved = rag_levels[0][1]
+        else:
+            retrieved = rag_dataset.retrieve_examples(input_NL, with_output=with_output)
+            format_kwargs["examples"] = retrieved["examples_text"]
 
     prompt_template = ChatPromptTemplate.from_messages(messages_for(technique))
 
@@ -465,12 +733,70 @@ def run(
     cascade_mode_level: Optional[str] = None
     cascade_mode_prompts: List[List[Dict[str, str]]] = []
     cascade_mode_prompt_tokens: List[Optional[int]] = []
+    adaptive_rag_level: Optional[str] = None
+    adaptive_rag_prompts: List[List[Dict[str, str]]] = []
+    adaptive_rag_prompt_tokens: List[Optional[int]] = []
 
-    if not cascade_mode:
-        attempt = _generate_execute_and_rescue(
-            llm, prompt_template, format_kwargs, model_name, graph, uses_schema, uses_rag, rescue_prompt, max_retries
+    if cascade_mode and cascade_strategy == CascadeStrategy.DELTA:
+        # cascade_mode and rescue_prompt are mutually exclusive (validated above), but the
+        # "delta" strategy reuses rescue_prompt's fix-up mechanics for every rung after the
+        # first — only that first rung is a fresh, self-contained attempt.
+        rescue_prompt_template = ChatPromptTemplate.from_messages(rescue_messages(uses_schema, uses_rag))
+        previous: Optional[_OneAttempt] = None
+        for i, (level, level_schema_text) in enumerate(schema_levels):
+            if previous is None:
+                level_kwargs = {**format_kwargs, "enhanced_schema": level_schema_text}
+                one = _generate_once(
+                    prompt_template, level_kwargs, llm, model_name, graph, input_NL,
+                    self_verification, verification_llm, verification_criteria,
+                )
+            else:
+                semantic_feedback = (
+                    previous.verification.reasoning
+                    if previous.verification and not previous.verification.answers_question
+                    else None
+                )
+                error_message = build_error_message(
+                    previous.executed, previous.result, previous.validation, previous.execution_error,
+                    semantic_feedback=semantic_feedback,
+                )
+                rescue_kwargs = {
+                    **format_kwargs,
+                    "enhanced_schema": level_schema_text,
+                    "query": previous.cypher,
+                    "error_message": error_message,
+                }
+                one = _generate_once(
+                    rescue_prompt_template, rescue_kwargs, llm, model_name, graph, input_NL,
+                    self_verification, verification_llm, verification_criteria,
+                )
+            cascade_mode_prompts.append(one.prompt_messages)
+            cascade_mode_prompt_tokens.append(one.prompt_tokens)
+            cascade_mode_level = level.value
+            schema_text = level_schema_text
+            previous = one
+            is_last = i == len(schema_levels) - 1
+            if is_last or not one.retry_needed:
+                break
+        attempt = _AttemptResult(
+            cypher=previous.cypher,
+            initial_cypher=previous.cypher,
+            prompt_messages=previous.prompt_messages,
+            prompt_tokens=previous.prompt_tokens,
+            executed=previous.executed,
+            result=previous.result,
+            validation=previous.validation,
+            execution_error=previous.execution_error,
+            execution_warnings=previous.execution_warnings,
+            rescue_attempts=0,
+            rescue_error_messages=[],
+            rescue_prompts=[],
+            rescue_prompt_tokens=[],
+            needs_retry=previous.retry_needed,
+            self_verification_passed=previous.verification.answers_question if previous.verification else None,
+            self_verification_reasoning=previous.verification.reasoning if previous.verification else None,
         )
-    else:
+    elif cascade_mode:
         # cascade_mode and rescue_prompt are mutually exclusive (validated above), so every
         # rung here is a single clean attempt, never followed by an error-aware fix-up retry.
         for i, (level, level_schema_text) in enumerate(schema_levels):
@@ -478,14 +804,38 @@ def run(
             attempt = _generate_execute_and_rescue(
                 llm, prompt_template, level_kwargs, model_name, graph, uses_schema, uses_rag,
                 rescue_prompt=False, max_retries=1,
+                self_verification=self_verification, verification_llm=verification_llm,
+                verification_criteria=verification_criteria,
             )
             cascade_mode_prompts.append(attempt.prompt_messages)
             cascade_mode_prompt_tokens.append(attempt.prompt_tokens)
             cascade_mode_level = level.value
             schema_text = level_schema_text
             is_last = i == len(schema_levels) - 1
+            if is_last or not attempt.needs_retry:
+                break
+    elif adaptive_rag:
+        # adaptive_rag and rescue_prompt are mutually exclusive (validated above), so every
+        # rung here is a single clean attempt, never followed by an error-aware fix-up retry.
+        for i, (level, retrieved_level) in enumerate(rag_levels):
+            level_kwargs = {**format_kwargs, "examples": retrieved_level["examples_text"]}
+            attempt = _generate_execute_and_rescue(
+                llm, prompt_template, level_kwargs, model_name, graph, uses_schema, uses_rag,
+                rescue_prompt=False, max_retries=1,
+            )
+            adaptive_rag_prompts.append(attempt.prompt_messages)
+            adaptive_rag_prompt_tokens.append(attempt.prompt_tokens)
+            adaptive_rag_level = level.value
+            retrieved = retrieved_level
+            is_last = i == len(rag_levels) - 1
             if is_last or not needs_rescue(attempt.executed, attempt.result, attempt.validation):
                 break
+    else:
+        attempt = _generate_execute_and_rescue(
+            llm, prompt_template, format_kwargs, model_name, graph, uses_schema, uses_rag, rescue_prompt, max_retries,
+            self_verification=self_verification, verification_llm=verification_llm,
+            verification_criteria=verification_criteria,
+        )
 
     return Text2CypherResult(
         question=input_NL,
@@ -511,4 +861,10 @@ def run(
         cascade_mode_attempts=len(cascade_mode_prompts),
         cascade_mode_prompts=cascade_mode_prompts,
         cascade_mode_prompt_tokens=cascade_mode_prompt_tokens,
+        adaptive_rag_level=adaptive_rag_level,
+        adaptive_rag_attempts=len(adaptive_rag_prompts),
+        adaptive_rag_prompts=adaptive_rag_prompts,
+        adaptive_rag_prompt_tokens=adaptive_rag_prompt_tokens,
+        self_verification_passed=attempt.self_verification_passed,
+        self_verification_reasoning=attempt.self_verification_reasoning,
     )

@@ -67,7 +67,7 @@ import os
 # is a common source of confusing 401 "Incorrect API key" errors.)
 os.environ["OPENAI_API_KEY"] = "...YOUR_OPENAI_API_KEY..."
 
-from text2cypher_composer import run, RAGDataset, Technique
+from text2cypher_composer import run, show, RAGDataset, Technique
 """)
 
 md("""\
@@ -103,96 +103,11 @@ code("""\
 input_NL = "How many miRNAs have the keyword 'precursor' in the label and a sequence size under 100 nucleotides?"
 """)
 
-code("""\
-def _print_messages(messages):
-    for message in messages:
-        print(f"  [{message['role']}]")
-        for line in message["content"].splitlines():
-            print(f"    {line}")
-
-def show(result, show_prompt=False):
-    \"\"\"Pretty-print a Text2CypherResult.
-
-    CyVer validation (syntax validity, schema-alignment score, property-access
-    score) is run on every generated query and is always printed, regardless
-    of whether the query executed. The result rows are printed too, if the
-    query executed successfully. `execution_error`/`execution_warnings` — the
-    native Neo4j error/notifications from the *final* attempt's actual
-    execution — are always printed too, independently of rescue_prompt.
-
-    `result.prompt` is the exact messages sent for the *initial* generation
-    attempt; if rescued, `result.rescue_prompts` holds one more fully-
-    instantiated prompt per rescue attempt. pass show_prompt=True to print
-    all of them (not just the initial one). `result.prompt_tokens` (via
-    tiktoken, None if it isn't installed) is the initial prompt's token
-    count — handy for comparing prompt size across technique/schema_mode
-    (how much schema filtering saves); `result.rescue_prompt_tokens` is the
-    parallel per-attempt count for rescue_prompts (a list of rescue_attempts
-    numbers when rescued — how many extra tokens rescue_prompt costs).
-    `result.cascade_mode_level`/`cascade_mode_attempts` (only set when
-    cascade_mode=True) are printed too, if present.
-    \"\"\"
-    print(f"Technique:        {result.technique}")
-    print(f"Model:            {result.model}")
-    print(f"Prompt tokens:    {result.prompt_tokens}")
-
-    if show_prompt:
-        all_prompts = [result.prompt] + result.rescue_prompts
-        if len(all_prompts) == 1:
-            print("\\nFull instantiated prompt:")
-            _print_messages(all_prompts[0])
-        else:
-            print(f"\\nFull instantiated prompts ({len(all_prompts)}: 1 initial + {len(all_prompts) - 1} rescue):")
-            for i, messages in enumerate(all_prompts):
-                label = "initial" if i == 0 else f"rescue attempt {i}"
-                print(f"  --- {label} ---")
-                _print_messages(messages)
-
-    if result.dry_run:
-        print("\\n[dry_run] Nothing was generated, executed, or validated — prompt only.")
-        return
-
-    print(f"\\nGenerated Cypher:\\n{result.cypher}\\n")
-
-    if result.executed:
-        print(f"Result ({len(result.result)} rows):")
-        for row in result.result[:5]:
-            print(" ", row)
-        if len(result.result) > 5:
-            print(f"  ... and {len(result.result) - 5} more rows")
-    else:
-        print("Execution FAILED (see execution_error/CyVer report below for why).")
-
-    if result.execution_error:
-        print(f"\\nExecution error: {result.execution_error}")
-    if result.execution_warnings:
-        print("Execution warnings (Neo4j notifications):")
-        for warning in result.execution_warnings:
-            print(f"  {warning}")
-
-    v = result.validation
-    print("\\nCyVer validation report:")
-    print(f"  Syntax valid:      {v.syntax_valid}")
-    if v.syntax_metadata:
-        print(f"  Syntax issues:     {v.syntax_metadata}")
-    print(f"  Schema score:      {v.schema_score:.2f}  (1.0 = fully aligned with the graph schema)")
-    if v.schema_metadata:
-        print(f"  Schema issues:     {v.schema_metadata}")
-    print(f"  Properties score:  {v.properties_score}")
-    if v.properties_metadata:
-        print(f"  Property issues:   {v.properties_metadata}")
-
-    if result.rescue_error_messages:
-        print(f"\\nRescue attempts: {result.rescue_attempts}")
-        print(f"Rescue prompt tokens: {result.rescue_prompt_tokens}")  # a list of rescue_attempts numbers
-        for i, msg in enumerate(result.rescue_error_messages, start=1):
-            print(f"  [attempt {i}] error_message sent to the fix-up prompt:")
-            for line in msg.splitlines():
-                print(f"    {line}")
-
-    if result.cascade_mode_level:
-        print(f"\\nSchema fallback rung used: {result.cascade_mode_level}  (of {result.cascade_mode_attempts} tried)")
-        print(f"Cascade prompt tokens: {result.cascade_mode_prompt_tokens}")  # one per rung tried
+md("""\
+`show()` (imported above, alongside `run`) is a pretty-printer for a `Text2CypherResult`: the
+generated Cypher, its result rows, the always-populated CyVer validation report, and — when
+present — rescue/`cascade_mode`/`adaptive_rag`/`self_verification` details. Pass
+`show_prompt=True` to also print the exact fully-instantiated prompt(s) sent to the model.
 """)
 
 md("""\
@@ -564,6 +479,59 @@ show(result_ie)
 
 print("\\n--- IE-pruned schema ---")
 print(result_ie.schema)
+""")
+
+md("""\
+### 4.8 Caching the schema across many `run()` calls (`cache_schema`)
+
+Extracting a graph's schema from Neo4j isn't free: the base extraction alone is 3+ APOC-backed
+queries, and the "enhanced" schema every pruning `schema_mode` above uses (§4.3-4.7) adds **one
+more query per node label and per relationship type** on top of that. None of this changes across
+the many questions of a benchmark run against the same database, so re-extracting it on every
+`run()` call — multiplied by every `cascade_mode` rung (§9) — is pure overhead that dominates
+wall-clock time once you're testing hundreds or thousands of questions.
+
+`cache_schema=True` (the **default**) caches the extracted schema per `(database, is_enhanced,
+sample)` and reuses it across every `run()` call made against the same graph instance — only the
+extraction step is cached, not the per-question filtering/pruning or any LLM call, so this cuts
+technical overhead, not model cost. To make the savings concrete without a live database, we wrap
+`database` in a tiny proxy that counts how many times `.query(...)` actually reaches it:
+""")
+
+code("""\
+from text2cypher_composer import clear_schema_cache, get_structured_schema
+
+class CountingGraph:
+    \"\"\"Wraps a Neo4jGraph and counts how many times .query() actually reaches it.\"\"\"
+    def __init__(self, graph):
+        self._graph = graph
+        self.query_count = 0
+
+    def query(self, *args, **kwargs):
+        self.query_count += 1
+        return self._graph.query(*args, **kwargs)
+
+counting_database = CountingGraph(database)
+clear_schema_cache(counting_database)  # start this demo from a clean cache
+
+get_structured_schema(counting_database, is_enhanced=True)
+print("Neo4j queries after the 1st call (cache miss):", counting_database.query_count)
+
+get_structured_schema(counting_database, is_enhanced=True)
+print("Neo4j queries after the 2nd call (cache hit):  ", counting_database.query_count)  # unchanged
+
+get_structured_schema(counting_database, is_enhanced=True, cache_schema=False)
+print("Neo4j queries after a cache_schema=False call: ", counting_database.query_count)  # grew again
+""")
+
+md("""\
+Pass `cache_schema=False` to `run()` if your schema genuinely changes mid-experiment (e.g. writing
+to the graph between questions), or call `clear_schema_cache(graph)` — or `clear_schema_cache()`
+with no argument to drop every graph's cached schema — to invalidate an already-cached entry
+instead of disabling caching outright. This also fixed a pre-existing inefficiency in
+`cascade_mode` (§9): its `"full"` rung used to re-extract the schema a *second* time within the
+same `run()` call instead of reusing what the `"narrow"`/`"nodes_only"` rungs already fetched —
+that's now free regardless of `cache_schema`.
 """)
 
 md("""\
@@ -968,7 +936,258 @@ show(result_cascade_skip_narrow)
 """)
 
 md("""\
-## 10. Fine-tuning your own model
+### 9.1 Incremental delta cascade (`cascade_strategy="delta"`)
+
+The cascade above repeats itself: `"narrow"`'s node labels/relationship types show up again,
+folded into `"nodes_only"`'s bigger blob — so a schema element already sent to the model in an
+earlier, failed rung gets paid for again in the next rung's prompt. `cascade_strategy="delta"`
+(default `"standard"`) avoids that: the first rung is still a fresh, self-contained prompt, but
+every rung after that reuses `rescue_prompt`'s error-aware fix-up mechanics (the previous rung's
+query, plus why it needed to move on) and shows only the schema elements *newly introduced* at
+this rung, not the ones already shown.
+
+We reuse the exact same flaky-then-fixed scenario as `result_cascade` above, so the two
+strategies' prompt token counts are directly comparable:
+""")
+
+code("""\
+delta_call_count = {"n": 0}
+
+def flaky_until_less_pruned_delta(_):
+    delta_call_count["n"] += 1
+    if delta_call_count["n"] == 1:
+        return broken_cypher  # fails on the "narrow" rung, same as the standard cascade above
+    return "MATCH (m:miRNA) RETURN m.Label AS miRNA LIMIT 5"
+
+result_delta_cascade = run(
+    input_NL=input_NL,
+    model=RunnableLambda(flaky_until_less_pruned_delta),
+    database=database,
+    technique="Schema",
+    schema_mode="exact_match",
+    cascade_mode=True,
+    cascade_strategy="delta",
+)
+
+print("Rung used:   ", result_delta_cascade.cascade_mode_level)
+print("Rungs tried: ", result_delta_cascade.cascade_mode_attempts)
+print("Final cypher:", result_delta_cascade.cypher)
+show(result_delta_cascade)
+
+print("\\nPrompt tokens per rung:")
+print("  standard cascade:", result_cascade.cascade_mode_prompt_tokens)
+print("  delta cascade:   ", result_delta_cascade.cascade_mode_prompt_tokens)
+""")
+
+md("""\
+The winning (second) rung's prompt is now a rescue-style continuation — referencing the first
+rung's broken query and why it failed — carrying only the schema newly introduced at
+`"nodes_only"`, not `"narrow"`'s again:
+""")
+
+code("""\
+print(result_delta_cascade.prompt[-1]["content"])
+""")
+
+md("""\
+## 10. Post-execution self-verification (`self_verification`)
+
+`rescue_prompt` (§8) and `cascade_mode` (§9) both decide whether to retry using purely mechanical
+checks: did the query fail to execute, come back empty, or fail CyVer's syntax check? None of
+that catches a query that runs cleanly, returns rows, and is syntactically valid, yet still
+doesn't answer what was actually asked — the wrong direction on a relationship, an aggregate over
+the wrong property, a filter that's subtly too broad/narrow, and so on.
+
+`self_verification=True` (default `False`) adds a **post-execution semantic check**: once an
+attempt looks mechanically fine, a model reviews the question, the generated `cypher`, and the
+rows it returned, and judges whether it actually answers the question. Often the same model that
+generated a query is able to catch its own mistake on a second look. A mechanically-broken
+attempt is retried as before, without spending a verification call on it — the semantic check
+only runs once mechanical checks already pass, and its verdict becomes the retry decision
+instead. Under `rescue_prompt`, a failed verdict's reasoning also flows into the fix-up prompt's
+`error_message`; under `cascade_mode`, a failed verdict at one rung falls through to the next
+exactly like a mechanical failure would.
+
+**Requires `rescue_prompt=True` or `cascade_mode=True`** — there would otherwise be no retry for
+a semantic verdict to inform:
+""")
+
+code("""\
+try:
+    run(
+        input_NL=input_NL,
+        model="gpt-4o",
+        database=database,
+        technique="vanilla",
+        self_verification=True,
+    )
+except ValueError as e:
+    print("Validation caught as expected:", e)
+""")
+
+md("""\
+The cells below use a tiny **stub** verifier model instead of a real API call, so this notebook
+runs without spending extra tokens on it — the mechanics (how a failed verdict feeds back into
+`rescue_prompt`/`cascade_mode`) are identical either way. It mimics the one real requirement
+`verify_semantics` has of `verification_model`: a `.with_structured_output(...)`-capable object
+(see `verification.py`).
+""")
+
+code("""\
+from langchain_core.runnables import RunnableLambda
+from text2cypher_composer import SemanticVerification
+
+class StubVerifierModel:
+    \"\"\"A fake structured-output-capable model for self_verification -- no API calls.\"\"\"
+    def __init__(self, judge):
+        self.judge = judge  # judge(rendered_prompt_text) -> SemanticVerification
+
+    def with_structured_output(self, schema, method=None):
+        return RunnableLambda(lambda prompt_value: self.judge(prompt_value.to_string()))
+""")
+
+md("""\
+### 10.1 With `rescue_prompt`
+
+A fake "model" that answers with progressively more rows — first `LIMIT 5`, then `LIMIT 20` —
+paired with a stub verifier that rejects the `LIMIT 5` answer as too narrow for the question and
+approves `LIMIT 20`. Both queries execute cleanly (no mechanical failure at all): only the
+semantic check tells them apart.
+""")
+
+code("""\
+semantic_call_count = {"n": 0}
+
+def flaky_semantics(_):
+    semantic_call_count["n"] += 1
+    limit = 5 if semantic_call_count["n"] == 1 else 20
+    return f"MATCH (m:miRNA) RETURN m.Label AS miRNA LIMIT {limit}"
+
+def judge_by_limit(prompt_text):
+    if "LIMIT 5" in prompt_text:
+        return SemanticVerification(
+            answers_question=False, reasoning="the question asks for a broader sample than 5 rows"
+        )
+    return SemanticVerification(answers_question=True, reasoning="LIMIT 20 covers what was asked")
+
+result_self_verified = run(
+    input_NL=input_NL,
+    model=RunnableLambda(flaky_semantics),
+    database=database,
+    technique="vanilla",
+    rescue_prompt=True,
+    self_verification=True,
+    verification_model=StubVerifierModel(judge_by_limit),
+)
+
+print("Rescued:", result_self_verified.rescued, "| attempts:", result_self_verified.rescue_attempts)
+print("Semantic verdict:", result_self_verified.self_verification_passed)
+print("Reasoning:  ", result_self_verified.self_verification_reasoning)
+show(result_self_verified)
+""")
+
+md("""\
+### 10.2 With `cascade_mode`
+
+Same idea, but a failed verdict now falls through to the next (less-pruned) rung instead of
+triggering a fix-up prompt:
+""")
+
+code("""\
+cascade_semantic_count = {"n": 0}
+
+def flaky_cascade_semantics(_):
+    cascade_semantic_count["n"] += 1
+    limit = 5 if cascade_semantic_count["n"] == 1 else 20
+    return f"MATCH (m:miRNA) RETURN m.Label AS miRNA LIMIT {limit}"
+
+result_cascade_verified = run(
+    input_NL=input_NL,
+    model=RunnableLambda(flaky_cascade_semantics),
+    database=database,
+    technique="Schema",
+    schema_mode="exact_match",
+    cascade_mode=True,
+    self_verification=True,
+    verification_model=StubVerifierModel(judge_by_limit),
+)
+
+print("Rung used:", result_cascade_verified.cascade_mode_level)  # falls through past the "narrow" rung
+print("Semantic verdict:", result_cascade_verified.self_verification_passed)
+show(result_cascade_verified)
+""")
+
+md("""\
+## 11. Adaptive RAG (`adaptive_rag`)
+
+RAG retrieval (§6) can under-supply context too: too few retrieved examples, and the model may
+never see the pattern it needs to write a correct query. `adaptive_rag=True` (default `False`) is
+the RAG-side sibling of `cascade_mode` (§9): it retries the *whole* generation — a fresh prompt,
+not `rescue_prompt`'s error-aware fix-up — with progressively **more** retrieved examples whenever
+an attempt fails to execute or comes back empty, stopping early once one rung succeeds:
+
+1. **`"minimal"`**: a single retrieved example (`n_results=1`).
+2. **`"moderate"`**: the dataset's configured `n_results` (§5's default, `3`) — today's default
+   retrieval behavior.
+3. **`"full"`**: every example in the collection (`n_results=collection.count()`) — the final
+   fallback, always tried last.
+
+Only meaningful — and only allowed — for a RAG-using `technique` (`"RAG"`, `"RAG+O"`,
+`"Schema+RAG"`, `"Schema+RAG+O"`).
+
+**`adaptive_rag` and `cascade_mode`/`rescue_prompt`/`max_retries` are mutually exclusive** — three
+different retry strategies for the same problem (a failing/empty query), not meant to be stacked.
+`run()` raises `ValueError` if more than one is set:
+""")
+
+code("""\
+try:
+    run(
+        input_NL=input_NL,
+        model="gpt-4o",
+        database=database,
+        technique="RAG",
+        dataset=dataset,
+        adaptive_rag=True,
+        cascade_mode=True,
+    )
+except ValueError as e:
+    print("Mutual-exclusivity caught as expected:", e)
+""")
+
+md("""\
+We reuse the same deliberately-broken query from §7 and the RAG `dataset` built in §5/§6, via a
+fake "model" that only manages to write a correct query starting from its *second* call — with
+`adaptive_rag=True`, that second call is the `"moderate"` rung (the `"minimal"` rung's attempt is
+the one that fails).
+""")
+
+code("""\
+adaptive_call_count = {"n": 0}
+
+def flaky_until_more_examples(_):
+    adaptive_call_count["n"] += 1
+    if adaptive_call_count["n"] == 1:
+        return broken_cypher  # the same broken query from §7 -- fails on the "minimal" rung
+    return "MATCH (m:miRNA) RETURN m.Label AS miRNA LIMIT 5"  # works from "moderate" onward
+
+result_adaptive = run(
+    input_NL=input_NL,
+    model=RunnableLambda(flaky_until_more_examples),
+    database=database,
+    technique="RAG",
+    dataset=dataset,
+    adaptive_rag=True,
+)
+
+print("Rung used:   ", result_adaptive.adaptive_rag_level)      # "minimal" / "moderate" / "full"
+print("Rungs tried: ", result_adaptive.adaptive_rag_attempts)   # 1..3
+print("Final cypher:", result_adaptive.cypher)
+show(result_adaptive)
+""")
+
+md("""\
+## 12. Fine-tuning your own model
 
 Two paths to a model specialized on your own question→Cypher examples, ported from
 `bio2C/evaluating_text2cypher/evaluating_text2cypher_gpt.ipynb` (dataset preparation) and
@@ -986,7 +1205,7 @@ Both paths start from the same leveled gold dataset.
 """)
 
 md("""\
-### 10.1 Loading a leveled gold dataset
+### 12.1 Loading a leveled gold dataset
 
 bio2C organizes fine-tuning gold sets into "levels" (`nodeLevel`, `1hop`, `2hop`, `3hop`,
 `hardLevel`, ...), each a JSON file of `{"question", "cypher"}` records. `load_finetune_levels`
@@ -1014,7 +1233,7 @@ ft_df
 """)
 
 md("""\
-### 10.2 Sizing a token budget, and a stratified train/test split
+### 12.2 Sizing a token budget, and a stratified train/test split
 
 `max_cypher_tokens` sizes a generation `max_tokens` budget from the longest gold query (useful
 for fine-tuning as well as bulk evaluation, so it isn't needlessly large — that slows things
@@ -1033,9 +1252,9 @@ train_df
 """)
 
 md("""\
-### 10.3 Exporting for fine-tuning
+### 12.3 Exporting for fine-tuning
 
-`write_local_finetune_dataset` writes the format `finetune_lora` (§10.4) reads back in;
+`write_local_finetune_dataset` writes the format `finetune_lora` (§12.4) reads back in;
 `build_gpt_finetune_jsonl` writes the chat-format `.jsonl` OpenAI's fine-tuning GUI expects —
 one `{"messages": [...]}` line per example, with an optional system message.
 """)
@@ -1053,7 +1272,7 @@ with open(gpt_jsonl.path, encoding="utf-8") as f:
 """)
 
 md("""\
-### 10.4 LoRA-finetuning a local model
+### 12.4 LoRA-finetuning a local model
 
 `finetune_lora` LoRA-finetunes a 4-bit-quantized base causal LM (`LoRATrainingConfig.base_model`
 defaults to `meta-llama/Llama-3.1-8B`, matching the notebook) on `train_df`'s question/Cypher
@@ -1076,7 +1295,7 @@ code("""\
 """)
 
 md("""\
-### 10.5 Using the fine-tuned (or any local) model with `run()`
+### 12.5 Using the fine-tuned (or any local) model with `run()`
 
 `load_finetuned_model` loads the adapter back as a `HuggingFacePipeline` `Runnable`,
 pre-configured with its own generation parameters — pass it straight through as `run()`'s
@@ -1084,7 +1303,7 @@ pre-configured with its own generation parameters — pass it straight through a
 match the notebook's inference-time prompt. A non-finetuned local pipeline (e.g. straight from
 `bio2C/evaluating_text2cypher/evaluating_text2cypher_llama.ipynb`) works the same way — just
 build the `HuggingFacePipeline` yourself instead of via `load_finetuned_model`. Also
-demonstration-only (needs a GPU, the same Hugging Face login from §10.4, and the model weights
+demonstration-only (needs a GPU, the same Hugging Face login from §12.4, and the model weights
 available).
 """)
 
@@ -1102,14 +1321,14 @@ code("""\
 """)
 
 md("""\
-## 11. Discovering available techniques and their prompts
+## 13. Discovering available techniques and their prompts
 
 A few introspection helpers, useful without needing a database/model/dataset at hand — e.g. to
 build a UI, validate a `technique` string before calling `run()`, or just remember what each
 technique needs and what it sends the model.
 """)
 
-md("### 11.1 `list_techniques()` — the accepted `technique` strings")
+md("### 13.1 `list_techniques()` — the accepted `technique` strings")
 
 code("""\
 from text2cypher_composer import list_techniques
@@ -1118,7 +1337,7 @@ list_techniques()
 """)
 
 md("""\
-### 11.2 `describe_technique()` / `list_technique_info()` — what each technique needs
+### 13.2 `describe_technique()` / `list_technique_info()` — what each technique needs
 
 Tells you whether a technique uses the enhanced schema and/or RAG (and, if RAG, whether it's the
 output-augmented `+O` variant) — i.e. whether `dataset` must be passed to `run()`.
@@ -1134,7 +1353,7 @@ for info in list_technique_info():
 """)
 
 md("""\
-### 11.3 `get_prompt_template()` / `get_all_prompt_templates()` — the parametric prompts
+### 13.3 `get_prompt_template()` / `get_all_prompt_templates()` — the parametric prompts
 
 The **unfilled** prompt for a technique — placeholders like `{question}`, `{enhanced_schema}`,
 `{examples}` are left as literal text. This is the template; for the fully-instantiated prompt
@@ -1156,7 +1375,7 @@ print(list(all_templates.keys()))
 """)
 
 md("""\
-## 12. Bulk evaluation against a gold test set
+## 14. Bulk evaluation against a gold test set
 
 `evaluate_technique` runs a technique over a whole gold `(question, query)` set and reports
 Jaro-Winkler, normalized Levenshtein, Jaccard, Coverage, and pass@k. We reuse the mock
@@ -1208,7 +1427,7 @@ eval_df[[
 """)
 
 md("""\
-## 13. Summary
+## 15. Summary
 
 - `run()` always returns a `Text2CypherResult` with: `question`, `technique`, `model`,
   `initial_cypher` (what the model generated first), `cypher` (the final, possibly rescued
@@ -1229,6 +1448,12 @@ md("""\
   to (or, for `"ie_extraction"`, up from) entity types only, the default — any combination of
   `"entity_types"`, `"relationship_types"`, `"node_properties"`, `"relationship_properties"`
   (see `SchemaComponent`/`list_schema_components()`).
+- `cache_schema=True` (the default, §4.8) caches a schema-using technique's extracted schema per
+  `(database, is_enhanced, sample)` and reuses it across every `run()` call against the same graph
+  instance — extraction is a fixed cost that doesn't change across a benchmark run, so this cuts
+  the technical schema-extraction overhead (not LLM cost) that otherwise dominates wall-clock time
+  once you're testing hundreds/thousands of questions. `cache_schema=False` always re-extracts;
+  `clear_schema_cache(graph)`/`clear_schema_cache()` invalidate one or every cached graph.
 - `dry_run=True` (§3.1) builds and returns `prompt` (schema/RAG resolved) without generating,
   executing, or validating anything — `cypher`/`result`/`validation` stay `None`. Incompatible
   with `rescue_prompt=True`.
@@ -1253,7 +1478,29 @@ md("""\
   strategy than `rescue_prompt`'s error-aware fix-up, so the two are mutually exclusive.
   `result.cascade_mode_level`/`result.cascade_mode_attempts`/`result.cascade_mode_prompts`/
   `result.cascade_mode_prompt_tokens` report which rung was used and what each tried rung cost.
-- Fine-tuning (§10): `load_finetune_levels`/`max_cypher_tokens`/`split_finetune_dataset` prepare a
+- `cascade_strategy="delta"` (§9.1, requires `cascade_mode=True`) is the "Incremental delta
+  cascade": the first rung is still a fresh, self-contained prompt, but every rung after that
+  reuses `rescue_prompt`'s fix-up mechanics (the previous rung's query, why it needed to move on)
+  and shows only the schema newly introduced at that rung, not what a previous rung already
+  showed — cutting redundant schema tokens across rungs. `result.schema` then holds that rung's
+  delta text, not the cumulative schema.
+- `self_verification=True` (§10, requires `rescue_prompt` or `cascade_mode`) adds a post-execution
+  semantic check on top of either retry strategy's mechanical one: once an attempt looks
+  mechanically fine, a model reviews `(question, cypher, result)` and judges whether it actually
+  answers the question — a failed verdict is folded into the same retry decision (feeding its
+  reasoning into `rescue_prompt`'s fix-up prompt, or falling through to the next `cascade_mode`
+  rung). `verification_model` (defaults to reusing `model`) and `verification_criteria` (extra
+  free-text evaluation guidance) are optional. `result.self_verification_passed`/
+  `result.self_verification_reasoning` report the final attempt's verdict, `None` if unused or if
+  the final attempt was already mechanically broken.
+- `adaptive_rag=True` (§11) is the RAG-side sibling of `cascade_mode`: it retries a failed/empty
+  query from scratch with progressively more retrieved examples ("minimal" → "moderate" → "full",
+  i.e. `n_results` of 1 → the dataset's configured default → every example in the collection),
+  stopping at the first rung that succeeds — mutually exclusive with both `cascade_mode` and
+  `rescue_prompt`/`max_retries` (pick one retry strategy). `result.adaptive_rag_level`/
+  `result.adaptive_rag_attempts`/`result.adaptive_rag_prompts`/`result.adaptive_rag_prompt_tokens`
+  report which rung was used and what each tried rung cost.
+- Fine-tuning (§12): `load_finetune_levels`/`max_cypher_tokens`/`split_finetune_dataset` prepare a
   leveled gold dataset, `write_local_finetune_dataset`/`build_gpt_finetune_jsonl` export it for
   `finetune_lora` (LoRA-finetune a local model) or OpenAI's fine-tuning GUI respectively; either
   way, the resulting model — a fine-tuned model id (string) or `load_finetuned_model`'s
@@ -1267,8 +1514,8 @@ md("""\
 - The available techniques are listed in `Technique`
   (`from text2cypher_composer import Technique`), or as plain strings via `list_techniques()`.
   `describe_technique()`/`list_technique_info()` tell you what each one needs, and
-  `get_prompt_template()`/`get_all_prompt_templates()` show its unfilled prompt (§11).
-- `evaluate_technique()` (§12) runs a technique over a gold test set and reports
+  `get_prompt_template()`/`get_all_prompt_templates()` show its unfilled prompt (§13).
+- `evaluate_technique()` (§14) runs a technique over a gold test set and reports
   Jaro-Winkler, Levenshtein, Jaccard, Coverage, and pass@k as an `EvaluationReport`
   (`.summary` for dataset-level averages, `.to_dataframe()` for a per-question table).
   `rescue_prompt`/`max_retries` forward to every attempt, and `.to_dataframe()`/

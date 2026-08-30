@@ -111,6 +111,26 @@ def test_skip_narrow_schema_filter_is_forwarded_to_the_resolver():
     assert result.cascade_mode_level == "nodes_only"
 
 
+def test_cache_schema_is_forwarded_to_the_resolver():
+    with patch("text2cypher_composer.core.resolve_database", return_value=MagicMock()), \
+         patch(
+             "text2cypher_composer.core.resolve_cascade_mode_levels", return_value=FAKE_LEVELS
+         ) as resolve_levels, \
+         patch("text2cypher_composer.core.execute_cypher_with_warnings", return_value=([{"n": 1}], [])), \
+         patch("text2cypher_composer.core.validate_cypher", return_value=_validation()):
+        run(
+            input_NL="q",
+            model=RunnableLambda(_fake_model),
+            database={},
+            technique="Schema",
+            schema_mode="exact_match",
+            cascade_mode=True,
+            cache_schema=False,
+        )
+
+    assert resolve_levels.call_args.kwargs["cache_schema"] is False
+
+
 def test_cascade_mode_and_rescue_prompt_are_mutually_exclusive():
     with pytest.raises(ValueError, match="mutually exclusive"):
         run(

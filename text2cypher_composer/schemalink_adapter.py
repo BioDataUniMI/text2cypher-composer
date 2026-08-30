@@ -11,7 +11,9 @@ which works over schema/text *file paths* and writes its extraction output to
 a JSON file rather than returning it: `schemalink_ie_engine()` writes both to
 a scratch temp directory (so it doesn't litter the caller's cwd with the
 pipeline's `generated/`/`output/` working directories) and reads the output
-back into the shape `ie_prune` expects.
+back into the shape `ie_prune` expects — including unwrapping the
+`schemaResponse` nesting the real pipeline's output uses (see
+`_normalize_extraction`).
 """
 from __future__ import annotations
 
@@ -66,6 +68,25 @@ def _filter_schema_yaml(
 
     schema["classes"] = classes
     return yaml.safe_dump(schema, sort_keys=False)
+
+
+def _normalize_extraction(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Unwrap schemalink-engine's raw per-class output to `ie_prune`'s expected shape.
+
+    The real pipeline nests each class's payload under a `schemaResponse` key
+    (`{class_name: {"schemaResponse": {"mentions": [...]}}}`) rather than
+    exposing `mentions` at the top level of each class's entry, which is what
+    `ie_prune`/`_extraction_mentions` (see `schema_modes.py`) expect — without
+    this, every class looks mention-free and `ie_prune` silently falls back
+    to the (near-)full schema. Entries without a `schemaResponse` key are
+    passed through unchanged, so an already-flat shape still works too.
+    """
+    normalized: Dict[str, Any] = {}
+    for class_name, entry in raw.items():
+        if isinstance(entry, dict) and "schemaResponse" in entry:
+            entry = entry["schemaResponse"] or {}
+        normalized[class_name] = entry
+    return normalized
 
 
 def schemalink_ie_engine(
@@ -151,7 +172,7 @@ def schemalink_ie_engine(
                     return {}
                 with open(output_path, "r", encoding="utf-8") as f:
                     content = f.read().strip()
-                return json.loads(content) if content else {}
+                return _normalize_extraction(json.loads(content)) if content else {}
             finally:
                 os.chdir(previous_cwd)
 

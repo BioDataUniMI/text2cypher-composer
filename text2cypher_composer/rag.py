@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import chromadb
 from langchain_core.embeddings import Embeddings
@@ -16,6 +16,7 @@ from .embeddings import (
     resolve_embedder,
     write_embedding_meta,
 )
+from .techniques import RAGExpansionLevel
 
 
 @dataclass
@@ -207,8 +208,14 @@ class RAGDataset:
         rel = Path(source)
         return self.output_dir / rel.parent / rel.name.replace("question", "output")
 
-    def retrieve_examples(self, question: str, with_output: bool) -> Dict[str, Any]:
+    def retrieve_examples(
+        self, question: str, with_output: bool, n_results: Optional[int] = None
+    ) -> Dict[str, Any]:
         """Retrieve the top-`n_results` nearest examples for `question`.
+
+        `n_results`, if given, overrides `self.n_results` for this call only
+        — used by `resolve_adaptive_rag_levels` to retrieve a different
+        number of examples per rung without mutating the dataset.
 
         Returns a dict with `examples_text` (ready to interpolate into a
         prompt), plus `example_ids`/`example_distances` for traceability.
@@ -216,7 +223,7 @@ class RAGDataset:
         query_embedding = self.embedder.embed_query(question)
         results = self.collection.query(
             query_embeddings=[query_embedding],
-            n_results=self.n_results,
+            n_results=n_results if n_results is not None else self.n_results,
             include=["documents", "metadatas", "distances"],
         )
 
@@ -256,3 +263,28 @@ class RAGDataset:
             "example_ids": example_ids,
             "example_distances": example_distances,
         }
+
+
+def resolve_adaptive_rag_levels(
+    dataset: "RAGDataset", question: str, with_output: bool
+) -> List[Tuple[RAGExpansionLevel, Dict[str, Any]]]:
+    """Resolve the retrieved examples for each rung of the `adaptive_rag` cascade, in order.
+
+    Returns `[(level, retrieved), ...]`, retrieving progressively more
+    examples: `RAGExpansionLevel.MINIMAL` (a single example), `.MODERATE`
+    (`dataset.n_results` examples — today's default), then always
+    `RAGExpansionLevel.FULL` last (every example in the collection). Each
+    `retrieved` dict is exactly what `RAGDataset.retrieve_examples` returns
+    (`examples_text`/`example_ids`/`example_distances`). No LLM calls
+    involved — this is the RAG-side sibling of
+    `schema_modes.resolve_cascade_mode_levels`.
+    """
+    total_examples = dataset.collection.count()
+    return [
+        (level, dataset.retrieve_examples(question, with_output, n_results=n))
+        for level, n in (
+            (RAGExpansionLevel.MINIMAL, 1),
+            (RAGExpansionLevel.MODERATE, dataset.n_results),
+            (RAGExpansionLevel.FULL, total_examples),
+        )
+    ]

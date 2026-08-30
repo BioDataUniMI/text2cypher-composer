@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.runnables import RunnableLambda
 
+from text2cypher_composer.schema import format_schema
 from text2cypher_composer.schema_modes import (
     SchemaSelection,
     exact_match_prune,
@@ -11,6 +12,8 @@ from text2cypher_composer.schema_modes import (
     mask_entities,
     ner_exact_match_prune,
     resolve_cascade_mode_levels,
+    resolve_schema_text,
+    schema_delta,
     similarity_prune,
     similarity_prune_nodes_only,
 )
@@ -169,8 +172,8 @@ def test_llm_prune_nodes_only_ignores_relationship_types():
 
 
 def test_resolve_cascade_mode_levels_exact_match_three_rungs_in_order():
-    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.get_schema", return_value="FULL SCHEMA TEXT"):
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA) as get_structured, \
+         patch("text2cypher_composer.schema_modes.get_schema") as get_schema:
         levels = resolve_cascade_mode_levels(
             MagicMock(), "exact_match", "Which miRNAs are over expressed in cancer?"
         )
@@ -183,17 +186,170 @@ def test_resolve_cascade_mode_levels_exact_match_three_rungs_in_order():
     narrow_text, nodes_only_text, full_text = (text for _, text in levels)
     assert "miRNA" in narrow_text and "Cancer" in narrow_text
     assert "miRNA" in nodes_only_text and "Cancer" in nodes_only_text
-    assert full_text == "FULL SCHEMA TEXT"
+    # the "full" rung reuses the schema already fetched for narrow/nodes_only -- one Neo4j
+    # round-trip per resolve_cascade_mode_levels() call, not a second get_schema() call
+    assert full_text == format_schema(STRUCTURED_SCHEMA, is_enhanced=True)
+    get_structured.assert_called_once()
+    get_schema.assert_not_called()
 
 
 def test_resolve_cascade_mode_levels_skip_narrow_only_has_two_rungs():
-    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.get_schema", return_value="FULL SCHEMA TEXT"):
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA):
         levels = resolve_cascade_mode_levels(
             MagicMock(), "exact_match", "Which miRNAs are over expressed in cancer?", skip_narrow=True
         )
 
     assert [level for level, _ in levels] == [CascadeModeLevel.NODES_ONLY, CascadeModeLevel.FULL]
+
+
+def test_resolve_cascade_mode_levels_forwards_cache_schema():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA) as get_structured:
+        resolve_cascade_mode_levels(
+            MagicMock(), "exact_match", "some question", cache_schema=False
+        )
+
+    assert get_structured.call_args.kwargs["cache_schema"] is False
+
+
+def test_resolve_schema_text_forwards_cache_schema():
+    with patch("text2cypher_composer.schema_modes.get_schema", return_value="SCHEMA TEXT") as get_schema:
+        resolve_schema_text(MagicMock(), "schema", "some question", cache_schema=False)
+
+    assert get_schema.call_args.kwargs["cache_schema"] is False
+
+
+def test_schema_delta_includes_new_labels_whole():
+    old = {"node_props": {"Gene": [{"property": "Label", "type": "STRING"}]}, "relationships": [], "rel_props": {}, "metadata": {}}
+    new = {
+        "node_props": {
+            "Gene": [{"property": "Label", "type": "STRING"}],
+            "miRNA": [{"property": "Label", "type": "STRING"}],
+        },
+        "relationships": [],
+        "rel_props": {},
+        "metadata": {},
+    }
+    delta = schema_delta(new, old)
+    assert delta["node_props"] == {"miRNA": [{"property": "Label", "type": "STRING"}]}
+
+
+def test_schema_delta_narrows_shared_label_to_new_properties_only():
+    old = {"node_props": {"miRNA": [{"property": "Label", "type": "STRING"}]}, "relationships": [], "rel_props": {}, "metadata": {}}
+    new = {
+        "node_props": {
+            "miRNA": [
+                {"property": "Label", "type": "STRING"},
+                {"property": "sequence_size", "type": "INTEGER"},
+            ],
+        },
+        "relationships": [],
+        "rel_props": {},
+        "metadata": {},
+    }
+    delta = schema_delta(new, old)
+    assert delta["node_props"] == {"miRNA": [{"property": "sequence_size", "type": "INTEGER"}]}
+
+
+def test_schema_delta_drops_a_label_with_nothing_new():
+    schema = {"node_props": {"miRNA": [{"property": "Label", "type": "STRING"}]}, "relationships": [], "rel_props": {}, "metadata": {}}
+    delta = schema_delta(schema, schema)
+    assert delta["node_props"] == {}
+    assert delta["relationships"] == []
+    assert delta["rel_props"] == {}
+
+
+def test_schema_delta_relationships_are_a_set_difference():
+    old = {
+        "node_props": {},
+        "relationships": [{"start": "Gene", "type": "TRANSCRIBED_TO", "end": "miRNA"}],
+        "rel_props": {},
+        "metadata": {},
+    }
+    new = {
+        "node_props": {},
+        "relationships": [
+            {"start": "Gene", "type": "TRANSCRIBED_TO", "end": "miRNA"},
+            {"start": "miRNA", "type": "OVER_EXPRESSED_IN", "end": "Cancer"},
+        ],
+        "rel_props": {},
+        "metadata": {},
+    }
+    delta = schema_delta(new, old)
+    assert delta["relationships"] == [{"start": "miRNA", "type": "OVER_EXPRESSED_IN", "end": "Cancer"}]
+
+
+def test_schema_delta_relationship_properties_narrowed_to_new_only():
+    old = {
+        "node_props": {},
+        "relationships": [],
+        "rel_props": {"TRANSCRIBED_TO": [{"property": "source", "type": "STRING"}]},
+        "metadata": {},
+    }
+    new = {
+        "node_props": {},
+        "relationships": [],
+        "rel_props": {
+            "TRANSCRIBED_TO": [
+                {"property": "source", "type": "STRING"},
+                {"property": "confidence", "type": "FLOAT"},
+            ],
+        },
+        "metadata": {},
+    }
+    delta = schema_delta(new, old)
+    assert delta["rel_props"] == {"TRANSCRIBED_TO": [{"property": "confidence", "type": "FLOAT"}]}
+
+
+_DELTA_NARROW = {
+    "node_props": {"miRNA": [{"property": "Label", "type": "STRING"}]},
+    "relationships": [],
+    "rel_props": {},
+    "metadata": {},
+}
+_DELTA_NODES_ONLY = {
+    "node_props": {
+        "miRNA": [{"property": "Label", "type": "STRING"}],
+        "Cancer": [{"property": "Label", "type": "STRING"}],
+    },
+    "relationships": [{"start": "miRNA", "type": "OVER_EXPRESSED_IN", "end": "Cancer"}],
+    "rel_props": {},
+    "metadata": {},
+}
+
+
+def test_resolve_cascade_mode_levels_delta_first_rung_is_full_narrow_schema():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=[_DELTA_NARROW, _DELTA_NODES_ONLY]):
+        levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
+
+    assert levels[0][1] == format_schema(_DELTA_NARROW, is_enhanced=True)
+
+
+def test_resolve_cascade_mode_levels_delta_second_rung_shows_only_new_elements():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=[_DELTA_NARROW, _DELTA_NODES_ONLY]):
+        levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
+
+    nodes_only_text = levels[1][1]
+    node_props_section = nodes_only_text.split("The relationships:")[0]
+    assert "Cancer" in node_props_section
+    # miRNA's own node-properties entry isn't repeated (already shown at the narrow rung) --
+    # it can still appear as a relationship endpoint, since OVER_EXPRESSED_IN itself is new here
+    assert "miRNA" not in node_props_section
+    assert "OVER_EXPRESSED_IN" in nodes_only_text
+
+
+def test_resolve_cascade_mode_levels_delta_third_rung_shows_only_full_minus_nodes_only():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=[_DELTA_NARROW, _DELTA_NODES_ONLY]):
+        levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
+
+    full_text = levels[2][1]
+    node_props_section = full_text.split("The relationships:")[0]
+    assert "Gene" in node_props_section
+    assert "miRNA" not in node_props_section
+    assert "Cancer" not in node_props_section
+    assert "TRANSCRIBED_TO" in full_text
 
 
 def test_resolve_cascade_mode_levels_rejects_non_pruning_modes():

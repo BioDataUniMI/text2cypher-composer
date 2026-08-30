@@ -20,6 +20,8 @@ item (``item_examples``) rather than a raw min/max size range.
 """
 from __future__ import annotations
 
+import threading
+import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
 BASE_KG_BUILDER_LABEL = "__KGBuilder__"
@@ -76,14 +78,73 @@ def _clean_string_values(text: str) -> str:
     return text.replace("\n", " ").replace("\r", " ")
 
 
-def get_schema(graph: Any, is_enhanced: bool = False, sample: int = 1000) -> str:
+# Caches the *extraction* step (the Neo4j round-trip `_fetch_structured_schema` makes) per
+# (graph, is_enhanced, sample), not the filtering that happens downstream in `schema_modes.py` —
+# that stays per-question, only the schema itself is invariant across a benchmark run. Keyed by
+# the graph instance via a WeakKeyDictionary so entries vanish automatically when the Neo4jGraph
+# is garbage-collected; the lock is cheap insurance, not because concurrent use is expected.
+_SCHEMA_CACHE: "weakref.WeakKeyDictionary[Any, Dict[Tuple[bool, int], Dict[str, Any]]]" = (
+    weakref.WeakKeyDictionary()
+)
+_SCHEMA_CACHE_LOCK = threading.Lock()
+
+
+def clear_schema_cache(graph: Optional[Any] = None) -> None:
+    """Drop cached schema extractions for `graph`, or every graph if `graph` is omitted.
+
+    Only needed if a graph's schema legitimately changes mid-experiment (the
+    cache otherwise never goes stale on its own since it's scoped to the
+    `Neo4jGraph` instance's lifetime) — see `get_structured_schema`'s
+    `cache_schema` argument.
+    """
+    with _SCHEMA_CACHE_LOCK:
+        if graph is None:
+            _SCHEMA_CACHE.clear()
+        else:
+            _SCHEMA_CACHE.pop(graph, None)
+
+
+def get_schema(graph: Any, is_enhanced: bool = False, sample: int = 1000, cache_schema: bool = True) -> str:
     """Return the graph schema as a formatted string (see `format_schema`)."""
-    structured_schema = get_structured_schema(graph, is_enhanced=is_enhanced, sample=sample)
+    structured_schema = get_structured_schema(
+        graph, is_enhanced=is_enhanced, sample=sample, cache_schema=cache_schema
+    )
     return format_schema(structured_schema, is_enhanced)
 
 
-def get_structured_schema(graph: Any, is_enhanced: bool = False, sample: int = 1000) -> Dict[str, Any]:
-    """Return {node_props, rel_props, relationships, metadata} for `graph`."""
+def get_structured_schema(
+    graph: Any, is_enhanced: bool = False, sample: int = 1000, cache_schema: bool = True
+) -> Dict[str, Any]:
+    """Return {node_props, rel_props, relationships, metadata} for `graph`.
+
+    `cache_schema` (default `True`) caches this per `(graph, is_enhanced,
+    sample)` — extracting a graph's schema from Neo4j is a fixed cost that
+    doesn't change across the many questions of a benchmark run against the
+    same database, so repeating it on every `run()` call (multiplied by
+    every `cascade_mode` rung) is pure overhead. Nothing downstream mutates
+    the returned dict, so handing back the same cached object across calls
+    is safe. Pass `False` to always re-extract (e.g. if the schema
+    legitimately changes mid-experiment), or see `clear_schema_cache` to
+    invalidate an already-cached entry instead.
+    """
+    if cache_schema:
+        key = (is_enhanced, sample)
+        with _SCHEMA_CACHE_LOCK:
+            graph_cache = _SCHEMA_CACHE.get(graph)
+            if graph_cache is not None and key in graph_cache:
+                return graph_cache[key]
+
+    structured_schema = _fetch_structured_schema(graph, is_enhanced=is_enhanced, sample=sample)
+
+    if cache_schema:
+        with _SCHEMA_CACHE_LOCK:
+            _SCHEMA_CACHE.setdefault(graph, {})[key] = structured_schema
+
+    return structured_schema
+
+
+def _fetch_structured_schema(graph: Any, is_enhanced: bool = False, sample: int = 1000) -> Dict[str, Any]:
+    """Actually query Neo4j for {node_props, rel_props, relationships, metadata} — no caching."""
     node_properties = [
         data["output"]
         for data in graph.query(
