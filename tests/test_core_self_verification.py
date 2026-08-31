@@ -28,7 +28,7 @@ def test_self_verification_triggers_rescue_on_failed_semantic_verdict():
         call_count["n"] += 1
         return "MATCH (n:WrongAnswer) RETURN n" if call_count["n"] == 1 else "MATCH (n:RightAnswer) RETURN n"
 
-    def fake_verify(_llm, _question, cypher, _result, criteria=None):
+    def fake_verify(_llm, _question, cypher, _result, schema=None, examples=None, criteria=None):
         if "WrongAnswer" in cypher:
             return SemanticVerification(answers_question=False, reasoning="wrong node label for the question")
         return SemanticVerification(answers_question=True, reasoning="looks right")
@@ -52,6 +52,59 @@ def test_self_verification_triggers_rescue_on_failed_semantic_verdict():
     assert result.self_verification_passed is True
     assert result.self_verification_reasoning == "looks right"
     assert "Semantic review: wrong node label for the question" in result.rescue_error_messages[0]
+
+
+def test_self_verification_forwards_the_schema_shown_to_the_generator():
+    """A verdict made blind to the schema is much less reliable -- verify_semantics must see the
+    exact same schema text the generator did for that attempt."""
+    with patch("text2cypher_composer.core.resolve_database", return_value=MagicMock()), \
+         patch("text2cypher_composer.core.resolve_schema_text", return_value="FAKE_SCHEMA_TEXT"), \
+         patch("text2cypher_composer.core.execute_cypher_with_warnings", return_value=([{"n": 1}], [])), \
+         patch("text2cypher_composer.core.validate_cypher", return_value=_validation()), \
+         patch(
+             "text2cypher_composer.core.verify_semantics",
+             return_value=SemanticVerification(answers_question=True, reasoning="ok"),
+         ) as verify_mock:
+        run(
+            input_NL="q",
+            model=RunnableLambda(lambda _: "MATCH (n:Gene) RETURN n"),
+            database={},
+            technique="Schema",
+            schema_mode="exact_match",
+            rescue_prompt=True,
+            self_verification=True,
+        )
+
+    assert verify_mock.call_args.kwargs["schema"] == "FAKE_SCHEMA_TEXT"
+
+
+def test_self_verification_forwards_the_examples_shown_to_the_generator():
+    fake_dataset = MagicMock()
+    fake_dataset.retrieve_examples.return_value = {
+        "examples_text": "FAKE_EXAMPLES_TEXT",
+        "example_ids": [],
+        "example_distances": [],
+    }
+
+    with patch("text2cypher_composer.core.resolve_database", return_value=MagicMock()), \
+         patch("text2cypher_composer.core._resolve_dataset", return_value=fake_dataset), \
+         patch("text2cypher_composer.core.execute_cypher_with_warnings", return_value=([{"n": 1}], [])), \
+         patch("text2cypher_composer.core.validate_cypher", return_value=_validation()), \
+         patch(
+             "text2cypher_composer.core.verify_semantics",
+             return_value=SemanticVerification(answers_question=True, reasoning="ok"),
+         ) as verify_mock:
+        run(
+            input_NL="q",
+            model=RunnableLambda(lambda _: "MATCH (n:Gene) RETURN n"),
+            database={},
+            technique="RAG",
+            dataset="unused-because-mocked",
+            rescue_prompt=True,
+            self_verification=True,
+        )
+
+    assert verify_mock.call_args.kwargs["examples"] == "FAKE_EXAMPLES_TEXT"
 
 
 def test_self_verification_not_invoked_when_mechanically_broken():
@@ -95,7 +148,7 @@ def _fake_cascade_model(prompt_value):
 
 
 def test_self_verification_falls_through_cascade_rungs_on_failed_semantic_verdict():
-    def fake_verify(_llm, _question, cypher, _result, criteria=None):
+    def fake_verify(_llm, _question, cypher, _result, schema=None, examples=None, criteria=None):
         if "Narrow" in cypher:
             return SemanticVerification(answers_question=False, reasoning="over-pruned schema, wrong answer")
         return SemanticVerification(answers_question=True, reasoning="looks right")

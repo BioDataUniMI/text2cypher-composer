@@ -7,6 +7,7 @@ from text2cypher_composer.schema import format_schema
 from text2cypher_composer.schema_modes import (
     SchemaSelection,
     exact_match_prune,
+    expand_labels_by_hops,
     llm_prune,
     llm_prune_nodes_only,
     mask_entities,
@@ -16,6 +17,7 @@ from text2cypher_composer.schema_modes import (
     schema_delta,
     similarity_prune,
     similarity_prune_nodes_only,
+    two_hop_expansion_prune,
 )
 from text2cypher_composer.techniques import CascadeModeLevel
 
@@ -300,56 +302,112 @@ def test_schema_delta_relationship_properties_narrowed_to_new_only():
     assert delta["rel_props"] == {"TRANSCRIBED_TO": [{"property": "confidence", "type": "FLOAT"}]}
 
 
-_DELTA_NARROW = {
-    "node_props": {"miRNA": [{"property": "Label", "type": "STRING"}]},
-    "relationships": [],
+CHAIN_SCHEMA = {
+    "node_props": {
+        "NodeA": [{"property": "Label", "type": "STRING"}],
+        "NodeB": [{"property": "Label", "type": "STRING"}],
+        "NodeC": [{"property": "Label", "type": "STRING"}],
+        "NodeD": [{"property": "Label", "type": "STRING"}],
+        "NodeE": [{"property": "Label", "type": "STRING"}],  # disconnected from the chain
+    },
+    "relationships": [
+        {"start": "NodeA", "type": "REL_AB", "end": "NodeB"},
+        {"start": "NodeB", "type": "REL_BC", "end": "NodeC"},
+        {"start": "NodeC", "type": "REL_CD", "end": "NodeD"},
+    ],
     "rel_props": {},
     "metadata": {},
 }
-_DELTA_NODES_ONLY = {
-    "node_props": {
-        "miRNA": [{"property": "Label", "type": "STRING"}],
-        "Cancer": [{"property": "Label", "type": "STRING"}],
-    },
-    "relationships": [{"start": "miRNA", "type": "OVER_EXPRESSED_IN", "end": "Cancer"}],
+
+
+def test_expand_labels_by_hops_one_hop():
+    assert set(expand_labels_by_hops(CHAIN_SCHEMA, ["NodeA"], hops=1)) == {"NodeA", "NodeB"}
+
+
+def test_expand_labels_by_hops_two_hops():
+    assert set(expand_labels_by_hops(CHAIN_SCHEMA, ["NodeA"], hops=2)) == {"NodeA", "NodeB", "NodeC"}
+
+
+def test_expand_labels_by_hops_three_hops_reaches_the_whole_chain():
+    assert set(expand_labels_by_hops(CHAIN_SCHEMA, ["NodeA"], hops=3)) == {"NodeA", "NodeB", "NodeC", "NodeD"}
+
+
+def test_expand_labels_by_hops_never_reaches_a_disconnected_label():
+    assert "NodeE" not in expand_labels_by_hops(CHAIN_SCHEMA, ["NodeA"], hops=10)
+
+
+def test_expand_labels_by_hops_treats_relationships_as_undirected_for_reachability():
+    # NodeD has no outgoing relationship, only an incoming NodeC->NodeD one -- still reachable
+    assert set(expand_labels_by_hops(CHAIN_SCHEMA, ["NodeD"], hops=1)) == {"NodeD", "NodeC"}
+
+
+def test_two_hop_expansion_prune_keeps_only_reached_labels_and_relationships():
+    pruned = two_hop_expansion_prune(CHAIN_SCHEMA, ["NodeA"], hops=2)
+    assert set(pruned["node_props"].keys()) == {"NodeA", "NodeB", "NodeC"}
+    kept_rel_types = {r["type"] for r in pruned["relationships"]}
+    assert kept_rel_types == {"REL_AB", "REL_BC"}  # REL_CD's endpoint NodeD is out of reach
+
+
+_CHAIN_NARROW = {
+    "node_props": {"NodeA": [{"property": "Label", "type": "STRING"}]},
+    "relationships": [],
     "rel_props": {},
     "metadata": {},
 }
 
 
 def test_resolve_cascade_mode_levels_delta_first_rung_is_full_narrow_schema():
-    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=[_DELTA_NARROW, _DELTA_NODES_ONLY]):
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", return_value=_CHAIN_NARROW):
         levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
 
-    assert levels[0][1] == format_schema(_DELTA_NARROW, is_enhanced=True)
+    assert levels[0][1] == format_schema(_CHAIN_NARROW, is_enhanced=True)
 
 
-def test_resolve_cascade_mode_levels_delta_second_rung_shows_only_new_elements():
-    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=[_DELTA_NARROW, _DELTA_NODES_ONLY]):
+def test_resolve_cascade_mode_levels_delta_second_rung_is_a_two_hop_expansion():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", return_value=_CHAIN_NARROW):
         levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
 
     nodes_only_text = levels[1][1]
     node_props_section = nodes_only_text.split("The relationships:")[0]
-    assert "Cancer" in node_props_section
-    # miRNA's own node-properties entry isn't repeated (already shown at the narrow rung) --
-    # it can still appear as a relationship endpoint, since OVER_EXPRESSED_IN itself is new here
-    assert "miRNA" not in node_props_section
-    assert "OVER_EXPRESSED_IN" in nodes_only_text
+    # NodeB/NodeC are within 2 hops of NodeA (the narrow rung's only label) -- new at this rung
+    assert "NodeB" in node_props_section
+    assert "NodeC" in node_props_section
+    # NodeA was already shown at the narrow rung -- not repeated
+    assert "NodeA" not in node_props_section
+    # NodeD is 3 hops away -- outside the 2-hop expansion entirely
+    assert "NodeD" not in nodes_only_text
 
 
-def test_resolve_cascade_mode_levels_delta_third_rung_shows_only_full_minus_nodes_only():
-    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=STRUCTURED_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=[_DELTA_NARROW, _DELTA_NODES_ONLY]):
+def test_resolve_cascade_mode_levels_delta_third_rung_shows_what_the_two_hop_expansion_missed():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", return_value=_CHAIN_NARROW):
         levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
 
     full_text = levels[2][1]
     node_props_section = full_text.split("The relationships:")[0]
-    assert "Gene" in node_props_section
-    assert "miRNA" not in node_props_section
-    assert "Cancer" not in node_props_section
-    assert "TRANSCRIBED_TO" in full_text
+    # NodeD (3 hops away) and NodeE (disconnected) are outside the 2-hop expansion -- new here
+    assert "NodeD" in node_props_section
+    assert "NodeE" in node_props_section
+    assert "NodeA" not in node_props_section
+    assert "NodeB" not in node_props_section
+    assert "NodeC" not in node_props_section
+
+
+def test_resolve_cascade_mode_levels_delta_skip_narrow_still_seeds_the_two_hop_expansion():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", return_value=_CHAIN_NARROW):
+        levels = resolve_cascade_mode_levels(
+            MagicMock(), "exact_match", "some question", strategy="delta", skip_narrow=True
+        )
+
+    assert [level for level, _ in levels] == [CascadeModeLevel.NODES_ONLY, CascadeModeLevel.FULL]
+    # narrow is never emitted as its own rung, but its label (NodeA) still seeded the expansion --
+    # the first emitted rung is shown in full (nothing before it to delta against)
+    first_text = levels[0][1]
+    assert "NodeA" in first_text and "NodeB" in first_text and "NodeC" in first_text
+    assert "NodeD" not in first_text
 
 
 def test_resolve_cascade_mode_levels_rejects_non_pruning_modes():

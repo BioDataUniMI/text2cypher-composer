@@ -17,12 +17,13 @@ those.
 ```bash
 git clone https://github.com/BioDataUniMI/text2cypher-composer.git
 cd text2cypher-composer
-pip install -e ".[finetune,local-embeddings,dataset-tools,test]"
+pip install -e ".[rag,finetune,local-embeddings,dataset-tools,test]"
 ```
 
-(`finetune`/`local-embeddings`/`dataset-tools` are only needed if you're
-touching those areas; `test` installs `pytest` to run the test suite in
-`tests/`.)
+(`rag`/`finetune`/`local-embeddings`/`dataset-tools` are only needed if you're
+touching those areas — `rag` (`chromadb`) is imported lazily, only inside
+`RAGDataset`, so every non-RAG component works without it; `test` installs
+`pytest` to run the test suite in `tests/`.)
 
 ## Adding a new technique
 

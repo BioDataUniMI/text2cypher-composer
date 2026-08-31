@@ -31,6 +31,15 @@ Cloned this repo instead and want an editable install that picks up local change
 Set `OPENAI_API_KEY` in the environment if using an OpenAI model id or the
 `RAGDataset` embedder (both default to OpenAI embeddings/chat models).
 
+Using a RAG-based technique (`"RAG"`, `"RAG+O"`, `"Schema+RAG"`, `"Schema+RAG+O"`, `adaptive_rag`,
+or `RAGDataset` directly) needs `chromadb`, an optional extra — the base install works fine for
+every non-RAG component (`"vanilla"`/`"Schema"`, `cascade_mode`, `rescue_prompt`,
+`self_verification`, ...) without it:
+
+```bash
+pip install "text2cypher-composer[rag]"
+```
+
 Using an Anthropic model id (e.g. `"claude-sonnet-5"`) needs `ANTHROPIC_API_KEY` set, plus an extra:
 
 ```bash
@@ -345,11 +354,24 @@ Only meaningful for a pruning `schema_mode` (`"exact_match"`, `"ner_exact_match"
 The cascade above repeats itself: `"narrow"`'s node labels/relationship types show up again,
 folded into `"nodes_only"`'s bigger blob, which shows up again inside `"full"`'s — so a schema
 element already sent to the model in an earlier, failed rung gets paid for again in every later
-rung's prompt. `cascade_strategy="delta"` (default `"standard"`) avoids that redundancy: the first
-rung (`"narrow"`) is still a fresh, self-contained prompt, but every rung after that reuses
-`rescue_prompt`'s error-aware fix-up mechanics — the previous rung's generated query, plus why it
-needed to move on — showing only the schema elements *newly introduced* at this rung
-(`schema_delta`), not the ones a previous rung already showed:
+rung's prompt. `cascade_strategy="delta"` (default `"standard"`) avoids that redundancy — and
+changes what the second rung actually is:
+
+1. **`"narrow"`** — unchanged, same as `"standard"`.
+2. **`"expansion_2hop"`** (replaces `"nodes_only"`'s pruning here) — a purely structural
+   expansion: take `"narrow"`'s node labels, treat the full schema as a graph where every
+   `(:A)-[:R]->(:B)` pattern is an edge between `A` and `B`, and expand outward 2 hops, collecting
+   every node label and relationship reached (see `two_hop_expansion_prune`). Independent of
+   `schema_mode` — it needs no `question`/`nlp`/`llm`/`ie_engine`, only the graph's own structure.
+3. **`"full"`** — unchanged.
+
+Every rung, at every step of the cascade, is still a **fresh, independent, self-contained
+prompt** — exactly like `cascade_strategy="standard"`, and deliberately *not* like
+`rescue_prompt`'s fix-up mechanic: a rung carries no reference to a previous rung's generated
+query or why it failed, so the effect of progressively revealing more schema can be studied in
+isolation from `rescue_prompt`'s error-aware correction. The only thing that changes per rung is
+the `enhanced_schema` payload itself: each rung after the first shows only the schema elements
+*newly introduced* at that rung (`schema_delta`), not the ones a previous rung already showed:
 
 ```python
 result = run(
@@ -362,16 +384,10 @@ result = run(
     cascade_strategy="delta",
 )
 
-print(result.cascade_mode_level)   # "narrow" / "nodes_only" / "full" — which one was used
+print(result.cascade_mode_level)   # "narrow" / "nodes_only" (= expansion_2hop here) / "full"
 print(result.schema)               # the DELTA text shown at that rung, not the cumulative schema
-print(result.prompt)               # for a rung after the first, a rescue-style continuation prompt
+print(result.prompt)               # a fresh, self-contained prompt -- no previous-rung reference
 ```
-
-This trades a bit of independence for the savings: a rung after the first is no longer a
-standalone, self-contained attempt — it explicitly depends on the previous rung's output (its
-query and why it failed), the same dependency `rescue_prompt` retries already have. It composes
-with `self_verification` exactly like `rescue_prompt` does: a failed semantic verdict's reasoning
-is folded into the next rung's fix-up context too.
 
 **Requires `cascade_mode=True`** — `run()` raises `ValueError` if `cascade_strategy` is anything
 other than `"standard"` without it.
@@ -384,11 +400,17 @@ RAG-side sibling of `cascade_mode` above: it retries the *whole* generation — 
 `rescue_prompt`'s error-aware fix-up — with progressively **more** retrieved examples whenever an
 attempt fails to execute or comes back empty, stopping early once one rung succeeds:
 
-1. **`"minimal"`**: a single retrieved example (`n_results=1`).
-2. **`"moderate"`**: the dataset's configured `n_results` (its default, `3`) — today's default
-   retrieval behavior.
-3. **`"full"`**: every example in the collection (`n_results=collection.count()`) — the final
-   fallback, always tried last.
+1. **`"minimal"`**: the dataset's configured `n_results` (its default, `3`) — today's normal,
+   non-adaptive retrieval count, so the first try is identical to a plain (non-adaptive) call.
+2. **`"moderate"`**: `min(2 * n_results, collection.count())`.
+3. **`"full"`**: `min(5 * n_results, collection.count())` — the largest of the three, always tried
+   last, but still a real, bounded cap — never *every* example in the collection, which for a
+   real dataset (hundreds/thousands of examples) would blow the prompt budget for no benefit.
+
+This is safe/informative by construction, not just "bigger": Chroma's top-k nearest-neighbor
+retrieval is deterministic and monotonic (top-3 is always a strict prefix of top-6, top-6 of
+top-15, ...), so a later rung's larger `n_results` only ever *adds* new, still-relevant
+(similarity-ranked) examples on top of an earlier rung's — never duplicates or reorders them.
 
 ```python
 result = run(

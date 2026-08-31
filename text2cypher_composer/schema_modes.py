@@ -186,6 +186,58 @@ def schema_delta(new: Dict[str, Any], old: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _relationship_neighbors(structured_schema: Dict[str, Any], labels: Iterable[str]) -> "set[str]":
+    """Node labels connected to any of `labels` by a relationship, in either direction.
+
+    Treats `structured_schema["relationships"]` as an undirected adjacency between labels — each
+    `(:A)-[:R]->(:B)` pattern is an edge between `A` and `B` for reachability purposes, direction
+    only matters for the Cypher pattern text itself, not for what's structurally "nearby".
+    """
+    label_set = set(labels)
+    neighbors: "set[str]" = set()
+    for r in structured_schema.get("relationships") or []:
+        start, end = r.get("start"), r.get("end")
+        if start in label_set and end is not None:
+            neighbors.add(end)
+        if end in label_set and start is not None:
+            neighbors.add(start)
+    return neighbors
+
+
+def expand_labels_by_hops(structured_schema: Dict[str, Any], start_labels: Iterable[str], hops: int) -> List[str]:
+    """BFS out from `start_labels` over `structured_schema`'s relationships, `hops` hops deep.
+
+    Returns every label reached within `hops` hops (`start_labels` included). Used by
+    `two_hop_expansion_prune` for `resolve_cascade_mode_levels`'s `strategy="delta"`
+    "expansion_2hop" rung.
+    """
+    reached = set(start_labels)
+    frontier = set(start_labels)
+    for _ in range(hops):
+        frontier = _relationship_neighbors(structured_schema, frontier) - reached
+        if not frontier:
+            break
+        reached |= frontier
+    return list(reached)
+
+
+def two_hop_expansion_prune(
+    structured_schema: Dict[str, Any], narrow_labels: Iterable[str], hops: int = 2
+) -> Dict[str, Any]:
+    """The "expansion_2hop" rung for `cascade_strategy="delta"`.
+
+    `narrow_labels`'s structural neighborhood, `hops` hops out over the full schema treated as a
+    graph of node labels connected by relationships (see `expand_labels_by_hops`) — every node
+    label and relationship reachable, `narrow_labels` included. Every property of a reached
+    label/type is kept, and a relationship survives iff both its endpoints were reached — the same
+    "nodes only" semantics `_apply_selection` already gives `exact_match_prune`'s
+    `DEFAULT_SCHEMA_COMPONENTS`, just with the label selection coming from graph reachability
+    instead of question-matching.
+    """
+    expanded_labels = expand_labels_by_hops(structured_schema, narrow_labels, hops)
+    return _apply_selection(structured_schema, expanded_labels, [])
+
+
 def exact_match_prune(
     structured_schema: Dict[str, Any],
     question: str,
@@ -631,12 +683,15 @@ def resolve_cascade_mode_levels(
     aggressive pruning: `CascadeModeLevel.NARROW` (node labels,
     relationship types, and properties all narrowed to the question —
     `ALL_SCHEMA_COMPONENTS`; skipped entirely if `skip_narrow`),
-    `CascadeModeLevel.NODES_ONLY` (only node labels matched —
-    `DEFAULT_SCHEMA_COMPONENTS`; relationships kept via shared endpoints,
-    every property of a selected label/type kept), then always
-    `CascadeModeLevel.FULL` last (the unpruned schema — built by re-formatting
-    the same `structured` schema already fetched above for the other rungs,
-    not a second Neo4j round-trip).
+    `CascadeModeLevel.NODES_ONLY` — under `strategy=STANDARD`, only node
+    labels matched (`DEFAULT_SCHEMA_COMPONENTS`; relationships kept via
+    shared endpoints, every property of a selected label/type kept); under
+    `strategy=DELTA`, instead the "expansion_2hop" rung: `narrow`'s node
+    labels expanded 2 hops out over the full schema's relationships (see
+    `two_hop_expansion_prune`) — purely structural, independent of `mode` —
+    then always `CascadeModeLevel.FULL` last (the unpruned schema — built by
+    re-formatting the same `structured` schema already fetched above for the
+    other rungs, not a second Neo4j round-trip).
 
     `mode` must be a pruning schema_mode — `"exact_match"`,
     `"ner_exact_match"`, `"similarity"`, `"llm_pruning"`, or
@@ -653,9 +708,9 @@ def resolve_cascade_mode_levels(
     `DELTA` (the "Incremental delta cascade") instead formats only the
     *first* rung in full — every rung after that gets `schema_delta(this
     rung's structured schema, the previous rung's)`, i.e. only the elements
-    not already shown at a previous rung. The rung *selection* itself
-    (narrow/nodes_only/full) is identical either way; only the formatting
-    differs.
+    not already shown at a previous rung — and additionally swaps the second
+    rung's *selection* itself from `nodes_only` pruning to the 2-hop
+    structural expansion described above.
     """
     mode = SchemaMode(mode)
     strategy = CascadeStrategy(strategy)
@@ -677,7 +732,10 @@ def resolve_cascade_mode_levels(
 
     structured_levels: List[Tuple[CascadeModeLevel, Dict[str, Any]]] = []
 
-    if not skip_narrow:
+    # DELTA needs narrow's label set to seed the 2-hop expansion even when skip_narrow=True
+    # skips *emitting* narrow as its own rung.
+    narrow: Optional[Dict[str, Any]] = None
+    if not skip_narrow or strategy == CascadeStrategy.DELTA:
         if mode == SchemaMode.EXACT_MATCH:
             narrow = exact_match_prune(structured, question, components=ALL_SCHEMA_COMPONENTS)
         elif mode == SchemaMode.NER_EXACT_MATCH:
@@ -688,9 +746,12 @@ def resolve_cascade_mode_levels(
             narrow = llm_prune(structured, question, llm)
         else:  # IE_EXTRACTION
             narrow = ie_prune(structured, question, ie_engine, components=ALL_SCHEMA_COMPONENTS)
+    if not skip_narrow:
         structured_levels.append((CascadeModeLevel.NARROW, narrow))
 
-    if mode == SchemaMode.EXACT_MATCH:
+    if strategy == CascadeStrategy.DELTA:
+        nodes_only = two_hop_expansion_prune(structured, (narrow or {}).get("node_props", {}).keys())
+    elif mode == SchemaMode.EXACT_MATCH:
         nodes_only = exact_match_prune(structured, question, components=DEFAULT_SCHEMA_COMPONENTS)
     elif mode == SchemaMode.NER_EXACT_MATCH:
         nodes_only = ner_exact_match_prune(structured, question, nlp, components=DEFAULT_SCHEMA_COMPONENTS)

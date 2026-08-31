@@ -31,7 +31,6 @@ dependencies = [
     "langchain-community>=0.2",
     "langchain-openai>=0.1",
     "neo4j>=5.27,<6",
-    "chromadb>=0.5",
     "CyVer>=2.0.0,<3",
     "pandas>=2.0",
     "textdistance>=4.6",
@@ -39,6 +38,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+rag = ["chromadb>=0.5"]
 anthropic = ["langchain-anthropic>=0.3"]
 google = ["langchain-google-genai>=2.0"]
 deepseek = ["langchain-deepseek>=0.1"]

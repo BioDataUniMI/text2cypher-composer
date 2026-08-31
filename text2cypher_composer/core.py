@@ -182,6 +182,8 @@ def _needs_retry(
     self_verification: bool,
     verification_llm: Optional[Any],
     verification_criteria: Optional[str],
+    schema: Optional[str] = None,
+    examples: Optional[str] = None,
 ) -> "tuple[bool, Optional[SemanticVerification]]":
     """Whether an attempt still needs a retry — mechanical checks first, semantic ones only if those pass.
 
@@ -190,13 +192,17 @@ def _needs_retry(
     short-circuits (no point spending a verification call on a query that
     doesn't even execute); otherwise `verify_semantics` is asked whether the
     query actually answers `question`, and its verdict becomes the retry
-    decision instead.
+    decision instead. `schema`/`examples` (the same context `cypher` was
+    actually generated from) are forwarded to `verify_semantics` so it isn't
+    judging blind — see its docstring for why that matters.
     """
     if needs_rescue(executed, result, validation):
         return True, None
     if not self_verification:
         return False, None
-    verification = verify_semantics(verification_llm, question, cypher, result, criteria=verification_criteria)
+    verification = verify_semantics(
+        verification_llm, question, cypher, result, schema=schema, examples=examples, criteria=verification_criteria
+    )
     return not verification.answers_question, verification
 
 
@@ -204,10 +210,9 @@ def _needs_retry(
 class _OneAttempt:
     """One single generation+execute+validate+retry-check shot from a given prompt/kwargs pair.
 
-    The building block both `_generate_execute_and_rescue` (its initial attempt, and each
-    `rescue_prompt` retry) and the `cascade_mode` `strategy="delta"` loop in `run()` are built
-    from — factored out so both share the exact same generate/execute/validate/`_needs_retry`
-    logic instead of duplicating it.
+    The building block `_generate_execute_and_rescue` is built from — its initial attempt, and
+    each `rescue_prompt` retry, share the exact same generate/execute/validate/`_needs_retry`
+    logic via this helper instead of duplicating it.
     """
 
     cypher: str
@@ -254,7 +259,8 @@ def _generate_once(
         execution_warnings = e.warnings
 
     retry_needed, verification = _needs_retry(
-        executed, result, validation, question, cypher, self_verification, verification_llm, verification_criteria
+        executed, result, validation, question, cypher, self_verification, verification_llm, verification_criteria,
+        schema=format_kwargs.get("enhanced_schema"), examples=format_kwargs.get("examples"),
     )
 
     return _OneAttempt(
@@ -451,19 +457,24 @@ def run(
         skip_narrow_schema_filter: if True, skip the "narrow" rung and start
             the `cascade_mode` cascade directly at "nodes_only". Requires
             `cascade_mode=True`.
-        cascade_strategy: how `cascade_mode`'s rungs are prompted — `"standard"`
-            (default) sends each rung as a fresh, self-contained prompt
-            carrying that rung's *entire* schema, same as if `cascade_mode`
-            were used alone. `"delta"` — the "Incremental delta cascade" —
-            keeps this fresh-prompt behavior only for the first rung
-            ("narrow"); every rung after that instead reuses
-            `rescue_prompt`'s error-aware fix-up mechanics (the previous
-            rung's generated query, plus why it needed to move on) but shows
-            only the schema elements newly introduced at this rung (see
-            `schema_modes.schema_delta`), not the ones already shown at a
-            previous rung — cutting redundant schema tokens repeated across
-            rungs, at the cost of each rung after the first depending on the
-            previous rung's output rather than being independent. Requires
+        cascade_strategy: how `cascade_mode`'s rungs are built — `"standard"`
+            (default) is today's behavior: `"narrow"` → `"nodes_only"` (only
+            node labels matched) → `"full"`, each rung a fresh,
+            self-contained prompt carrying that rung's *entire* schema.
+            `"delta"` — the "Incremental delta cascade" — changes two
+            things: (1) the second rung becomes `"expansion_2hop"` instead
+            of `"nodes_only"` pruning — `narrow`'s node labels expanded 2
+            hops out over the full schema treated as a graph of labels
+            connected by relationships (see `schema_modes.
+            two_hop_expansion_prune`), purely structural and independent of
+            `schema_mode`; (2) every rung still gets a fresh, independent,
+            self-contained prompt (no reference to a previous rung's query
+            or failure — deliberately *not* `rescue_prompt`-style, so the
+            schema-expansion effect can be studied in isolation from
+            `rescue_prompt`'s error-aware correction), but its
+            `enhanced_schema` is only the elements not already shown at a
+            previous rung (see `schema_modes.schema_delta`) — cutting
+            redundant schema tokens repeated across rungs. Requires
             `cascade_mode=True` — `run()` raises `ValueError` if
             `cascade_strategy="delta"` is passed with `cascade_mode=False`.
         adaptive_rag: if True, an attempt that fails to execute or comes
@@ -566,10 +577,11 @@ def run(
         `cascade_mode_prompt_tokens` list, one per rung tried, that
         rung's initial prompt/token count — all default to `None`/`0`/`[]`
         if `cascade_mode` wasn't used. Under `cascade_strategy="delta"`,
-        `schema` holds only the *delta* text actually shown at the winning
-        rung (not the cumulative schema up to it) — the rest of what that
-        rung's model call saw (the previous rung's query, why it needed to
-        move on) is visible in `prompt` instead. If `adaptive_rag` was used instead,
+        `"nodes_only"` is the 2-hop structural expansion rather than
+        `nodes_only` pruning, and `schema` holds only the *delta* text
+        actually shown at the winning rung (not the cumulative schema up to
+        it) — still a fresh, self-contained prompt with no reference to a
+        previous rung's query or failure. If `adaptive_rag` was used instead,
         `adaptive_rag_level`/`adaptive_rag_attempts`/`adaptive_rag_prompts`/
         `adaptive_rag_prompt_tokens` are the same shape, one rung per
         retrieved-example count tried ("minimal"/"moderate"/"full") instead
@@ -737,68 +749,14 @@ def run(
     adaptive_rag_prompts: List[List[Dict[str, str]]] = []
     adaptive_rag_prompt_tokens: List[Optional[int]] = []
 
-    if cascade_mode and cascade_strategy == CascadeStrategy.DELTA:
-        # cascade_mode and rescue_prompt are mutually exclusive (validated above), but the
-        # "delta" strategy reuses rescue_prompt's fix-up mechanics for every rung after the
-        # first — only that first rung is a fresh, self-contained attempt.
-        rescue_prompt_template = ChatPromptTemplate.from_messages(rescue_messages(uses_schema, uses_rag))
-        previous: Optional[_OneAttempt] = None
-        for i, (level, level_schema_text) in enumerate(schema_levels):
-            if previous is None:
-                level_kwargs = {**format_kwargs, "enhanced_schema": level_schema_text}
-                one = _generate_once(
-                    prompt_template, level_kwargs, llm, model_name, graph, input_NL,
-                    self_verification, verification_llm, verification_criteria,
-                )
-            else:
-                semantic_feedback = (
-                    previous.verification.reasoning
-                    if previous.verification and not previous.verification.answers_question
-                    else None
-                )
-                error_message = build_error_message(
-                    previous.executed, previous.result, previous.validation, previous.execution_error,
-                    semantic_feedback=semantic_feedback,
-                )
-                rescue_kwargs = {
-                    **format_kwargs,
-                    "enhanced_schema": level_schema_text,
-                    "query": previous.cypher,
-                    "error_message": error_message,
-                }
-                one = _generate_once(
-                    rescue_prompt_template, rescue_kwargs, llm, model_name, graph, input_NL,
-                    self_verification, verification_llm, verification_criteria,
-                )
-            cascade_mode_prompts.append(one.prompt_messages)
-            cascade_mode_prompt_tokens.append(one.prompt_tokens)
-            cascade_mode_level = level.value
-            schema_text = level_schema_text
-            previous = one
-            is_last = i == len(schema_levels) - 1
-            if is_last or not one.retry_needed:
-                break
-        attempt = _AttemptResult(
-            cypher=previous.cypher,
-            initial_cypher=previous.cypher,
-            prompt_messages=previous.prompt_messages,
-            prompt_tokens=previous.prompt_tokens,
-            executed=previous.executed,
-            result=previous.result,
-            validation=previous.validation,
-            execution_error=previous.execution_error,
-            execution_warnings=previous.execution_warnings,
-            rescue_attempts=0,
-            rescue_error_messages=[],
-            rescue_prompts=[],
-            rescue_prompt_tokens=[],
-            needs_retry=previous.retry_needed,
-            self_verification_passed=previous.verification.answers_question if previous.verification else None,
-            self_verification_reasoning=previous.verification.reasoning if previous.verification else None,
-        )
-    elif cascade_mode:
+    if cascade_mode:
         # cascade_mode and rescue_prompt are mutually exclusive (validated above), so every
-        # rung here is a single clean attempt, never followed by an error-aware fix-up retry.
+        # rung here is a single clean, self-contained attempt, never followed by an error-aware
+        # fix-up retry -- this holds for both cascade_strategy values. "delta" only changes what
+        # resolve_cascade_mode_levels puts in schema_levels (a 2-hop structural expansion for the
+        # second rung, and each rung's text limited to what wasn't already shown at a previous
+        # one), not how a rung is generated here — keeping the schema-expansion effect isolated
+        # from any rescue-style correction dynamic.
         for i, (level, level_schema_text) in enumerate(schema_levels):
             level_kwargs = {**format_kwargs, "enhanced_schema": level_schema_text}
             attempt = _generate_execute_and_rescue(

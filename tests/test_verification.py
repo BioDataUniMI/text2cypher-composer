@@ -79,6 +79,54 @@ def test_verify_semantics_omits_criteria_block_when_not_given():
     assert "Additional evaluation criteria" not in captured["text"]
 
 
+def test_verify_semantics_includes_the_schema_when_given():
+    captured = {}
+
+    def _capture(prompt_value):
+        captured["text"] = prompt_value.to_string()
+        return SemanticVerification(answers_question=True, reasoning="ok")
+
+    llm = _fake_llm(_capture)
+    verify_semantics(
+        llm, "How many genes?", "MATCH (g:Gene) RETURN count(g)", [{"count(g)": 3}],
+        schema="Node properties:\n- **Gene**\n  - `Label`: STRING",
+    )
+
+    assert "Graph schema:" in captured["text"]
+    assert "- **Gene**" in captured["text"]
+
+
+def test_verify_semantics_includes_examples_when_given():
+    captured = {}
+
+    def _capture(prompt_value):
+        captured["text"] = prompt_value.to_string()
+        return SemanticVerification(answers_question=True, reasoning="ok")
+
+    llm = _fake_llm(_capture)
+    verify_semantics(
+        llm, "q", "MATCH (n) RETURN n", [{"n": 1}],
+        examples="[Query natural language] How many genes?\n[Query Cypher] MATCH (g:Gene) RETURN count(g)",
+    )
+
+    assert "Examples:" in captured["text"]
+    assert "MATCH (g:Gene) RETURN count(g)" in captured["text"]
+
+
+def test_verify_semantics_omits_schema_and_examples_blocks_when_not_given():
+    captured = {}
+
+    def _capture(prompt_value):
+        captured["text"] = prompt_value.to_string()
+        return SemanticVerification(answers_question=True, reasoning="ok")
+
+    llm = _fake_llm(_capture)
+    verify_semantics(llm, "q", "MATCH (n) RETURN n", [{"n": 1}])
+
+    assert "Graph schema:" not in captured["text"]
+    assert "Examples:" not in captured["text"]
+
+
 def test_verify_semantics_truncates_a_large_result_preview():
     captured = {}
 

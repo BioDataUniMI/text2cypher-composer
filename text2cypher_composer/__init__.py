@@ -40,6 +40,7 @@ from .verification import SemanticVerification, verify_semantics
 from .schema_modes import (
     SchemaSelection,
     exact_match_prune,
+    expand_labels_by_hops,
     ie_prune,
     llm_prune,
     llm_prune_nodes_only,
@@ -50,6 +51,7 @@ from .schema_modes import (
     similarity_prune,
     similarity_prune_nodes_only,
     structured_schema_to_linkml,
+    two_hop_expansion_prune,
 )
 from .techniques import (
     ALL_SCHEMA_COMPONENTS,
@@ -101,6 +103,8 @@ __all__ = [
     "CascadeStrategy",
     "resolve_cascade_mode_levels",
     "schema_delta",
+    "expand_labels_by_hops",
+    "two_hop_expansion_prune",
     "RAGExpansionLevel",
     "resolve_adaptive_rag_levels",
     "SchemaSelection",

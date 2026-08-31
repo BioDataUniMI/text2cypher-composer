@@ -60,7 +60,9 @@ def test_delta_cascade_first_rung_uses_a_fresh_self_contained_prompt():
     assert "error message" not in first_prompt_text.lower()
 
 
-def test_delta_cascade_second_rung_is_a_rescue_style_continuation():
+def test_delta_cascade_second_rung_is_also_a_fresh_self_contained_prompt():
+    """No rescue-style coupling: the schema-expansion effect must stay isolated from any
+    correction/rescue dynamic -- rung 2 gets no reference to rung 1's query or failure reason."""
     def fake_execute(_graph, cypher):
         if "Narrow" in cypher:
             raise CypherExecutionError("Cypher semantic error", "Unknown label 'Narrow'")
@@ -86,15 +88,16 @@ def test_delta_cascade_second_rung_is_a_rescue_style_continuation():
     assert result.cascade_mode_attempts == 2
 
     second_prompt_text = " ".join(m["content"] for m in result.cascade_mode_prompts[1])
-    # rescue-style: references the previous rung's failed query and why it failed
-    assert "MATCH (n:Narrow) RETURN n" in second_prompt_text
-    assert "Unknown label 'Narrow'" in second_prompt_text
+    # no reference at all to the previous rung's query or why it failed
+    assert "MATCH (n:Narrow) RETURN n" not in second_prompt_text
+    assert "Unknown label 'Narrow'" not in second_prompt_text
+    assert "error message" not in second_prompt_text.lower()
     # only the NEW schema at this rung is shown -- not the narrow rung's, already seen
     assert "NODES_ONLY_DELTA_SCHEMA" in second_prompt_text
     assert "NARROW_DELTA_SCHEMA" not in second_prompt_text
 
 
-def test_delta_cascade_falls_through_to_full_when_second_rung_also_fails():
+def test_delta_cascade_falls_through_to_full_with_no_rescue_coupling_either():
     def fake_execute(_graph, cypher):
         if "Full" in cypher:
             return [{"n": 1}], []
@@ -120,12 +123,13 @@ def test_delta_cascade_falls_through_to_full_when_second_rung_also_fails():
     assert result.cascade_mode_attempts == 3
 
     third_prompt_text = " ".join(m["content"] for m in result.cascade_mode_prompts[2])
-    assert "MATCH (n:NodesOnly) RETURN n" in third_prompt_text  # references rung 2's attempt, not rung 1's
+    assert "MATCH (n:NodesOnly) RETURN n" not in third_prompt_text  # no reference to rung 2's attempt
+    assert "still broken" not in third_prompt_text
     assert "FULL_DELTA_SCHEMA" in third_prompt_text
 
 
-def test_delta_cascade_composes_with_self_verification():
-    def fake_verify(_llm, _question, cypher, _result, criteria=None):
+def test_delta_cascade_composes_with_self_verification_without_leaking_into_the_next_prompt():
+    def fake_verify(_llm, _question, cypher, _result, schema=None, examples=None, criteria=None):
         if "Narrow" in cypher:
             return SemanticVerification(answers_question=False, reasoning="wrong node label for the question")
         return SemanticVerification(answers_question=True, reasoning="looks right")
@@ -146,10 +150,15 @@ def test_delta_cascade_composes_with_self_verification():
             self_verification=True,
         )
 
+    # self_verification still gates the per-rung retry decision (a failed verdict on rung 1
+    # falls through to rung 2, same as a mechanical failure would) ...
     assert result.cascade_mode_level == "nodes_only"
     assert result.self_verification_passed is True
+    # ... but its reasoning is never fed into the next rung's prompt -- there is no "next rung's
+    # prompt" concept of a fix-up here, each rung stays independent of the one before it.
     second_prompt_text = " ".join(m["content"] for m in result.cascade_mode_prompts[1])
-    assert "Semantic review: wrong node label for the question" in second_prompt_text
+    assert "wrong node label for the question" not in second_prompt_text
+    assert "Semantic review" not in second_prompt_text
 
 
 def test_cascade_strategy_delta_requires_cascade_mode():

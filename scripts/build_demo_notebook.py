@@ -39,8 +39,9 @@ using the six prompting strategies from the bio2C benchmark:
 | `"Schema+RAG+O"`  |      ✓      |           ✓            |
 
 **Prerequisites:**
-- the package installed: `pip install text2cypher-composer` — or, if you've cloned the repo and
-  want an editable install instead, `pip install -e .` from the repo root
+- the package installed, with the `rag` extra (this notebook builds and queries a RAG dataset in
+  §5/§6): `pip install "text2cypher-composer[rag]"` — or, if you've cloned the repo and want an
+  editable install instead, `pip install -e ".[rag]"` from the repo root
 - a valid `OPENAI_API_KEY` environment variable (used both for the `"gpt-4o"` model and for the
   RAG embeddings)
 - network access to the test Neo4j database used throughout the bio2C notebooks (credentials
@@ -48,11 +49,12 @@ using the six prompting strategies from the bio2C benchmark:
 """)
 
 code("""\
-# (If not done already) install the package.
-# %pip install text2cypher-composer
+# (If not done already) install the package, with the `rag` extra (this notebook builds and
+# queries a RAG dataset in §5/§6) -- the base install alone is enough for non-RAG components.
+# %pip install "text2cypher-composer[rag]"
 #
 # Cloned the repo instead and want an editable install that picks up local changes?
-# %pip install -e .
+# %pip install -e ".[rag]"
 """)
 
 code("""\
@@ -941,10 +943,16 @@ md("""\
 The cascade above repeats itself: `"narrow"`'s node labels/relationship types show up again,
 folded into `"nodes_only"`'s bigger blob — so a schema element already sent to the model in an
 earlier, failed rung gets paid for again in the next rung's prompt. `cascade_strategy="delta"`
-(default `"standard"`) avoids that: the first rung is still a fresh, self-contained prompt, but
-every rung after that reuses `rescue_prompt`'s error-aware fix-up mechanics (the previous rung's
-query, plus why it needed to move on) and shows only the schema elements *newly introduced* at
-this rung, not the ones already shown.
+(default `"standard"`) avoids that, and changes what the second rung is: instead of `"nodes_only"`
+pruning, it becomes `"expansion_2hop"` — a purely structural expansion of `"narrow"`'s node labels,
+2 hops out over the full schema treated as a graph (every `(:A)-[:R]->(:B)` pattern an edge between
+`A` and `B`), independent of `schema_mode`.
+
+Every rung stays a **fresh, independent, self-contained prompt** — no reference to a previous
+rung's query or failure, deliberately unlike `rescue_prompt`'s fix-up mechanic, so the effect of
+progressively revealing more schema can be studied on its own. Only the schema payload changes per
+rung: each one after the first shows only what's newly introduced, not what a previous rung
+already showed.
 
 We reuse the exact same flaky-then-fixed scenario as `result_cascade` above, so the two
 strategies' prompt token counts are directly comparable:
@@ -980,9 +988,9 @@ print("  delta cascade:   ", result_delta_cascade.cascade_mode_prompt_tokens)
 """)
 
 md("""\
-The winning (second) rung's prompt is now a rescue-style continuation — referencing the first
-rung's broken query and why it failed — carrying only the schema newly introduced at
-`"nodes_only"`, not `"narrow"`'s again:
+The winning (second) rung's prompt is still a fresh, self-contained "Schema" prompt — no
+reference to the first rung's broken query, no error message — carrying only the schema newly
+introduced at `"expansion_2hop"`, not `"narrow"`'s again:
 """)
 
 code("""\
@@ -1126,11 +1134,18 @@ the RAG-side sibling of `cascade_mode` (§9): it retries the *whole* generation 
 not `rescue_prompt`'s error-aware fix-up — with progressively **more** retrieved examples whenever
 an attempt fails to execute or comes back empty, stopping early once one rung succeeds:
 
-1. **`"minimal"`**: a single retrieved example (`n_results=1`).
-2. **`"moderate"`**: the dataset's configured `n_results` (§5's default, `3`) — today's default
-   retrieval behavior.
-3. **`"full"`**: every example in the collection (`n_results=collection.count()`) — the final
-   fallback, always tried last.
+1. **`"minimal"`**: the dataset's configured `n_results` (§5's default, `3`) — today's normal,
+   non-adaptive retrieval count, so the first try is identical to a plain (non-adaptive) call.
+2. **`"moderate"`**: `min(2 * n_results, collection.count())`.
+3. **`"full"`**: `min(5 * n_results, collection.count())` — the largest of the three, always
+   tried last, but still a real, bounded cap — never *every* example in the collection, which
+   for a real dataset (hundreds/thousands of examples) would blow the prompt budget for no
+   benefit.
+
+This is safe/informative by construction, not just "bigger": Chroma's top-k nearest-neighbor
+retrieval is deterministic and monotonic (top-3 is always a strict prefix of top-6, top-6 of
+top-15, ...), so a later rung's larger `n_results` only ever *adds* new, still-relevant
+(similarity-ranked) examples on top of an earlier rung's — never duplicates or reorders them.
 
 Only meaningful — and only allowed — for a RAG-using `technique` (`"RAG"`, `"RAG+O"`,
 `"Schema+RAG"`, `"Schema+RAG+O"`).
@@ -1479,11 +1494,13 @@ md("""\
   `result.cascade_mode_level`/`result.cascade_mode_attempts`/`result.cascade_mode_prompts`/
   `result.cascade_mode_prompt_tokens` report which rung was used and what each tried rung cost.
 - `cascade_strategy="delta"` (§9.1, requires `cascade_mode=True`) is the "Incremental delta
-  cascade": the first rung is still a fresh, self-contained prompt, but every rung after that
-  reuses `rescue_prompt`'s fix-up mechanics (the previous rung's query, why it needed to move on)
-  and shows only the schema newly introduced at that rung, not what a previous rung already
-  showed — cutting redundant schema tokens across rungs. `result.schema` then holds that rung's
-  delta text, not the cumulative schema.
+  cascade": the second rung becomes `"expansion_2hop"` — a purely structural 2-hop expansion of
+  `"narrow"`'s node labels over the full schema graph — instead of `"nodes_only"` pruning. Every
+  rung, including this one, stays a fresh, independent, self-contained prompt (no reference to a
+  previous rung's query or failure, unlike `rescue_prompt`) and shows only the schema newly
+  introduced at that rung, not what a previous rung already showed — cutting redundant schema
+  tokens across rungs while keeping the schema-expansion effect isolated from any correction
+  mechanic. `result.schema` then holds that rung's delta text, not the cumulative schema.
 - `self_verification=True` (§10, requires `rescue_prompt` or `cascade_mode`) adds a post-execution
   semantic check on top of either retry strategy's mechanical one: once an attempt looks
   mechanically fine, a model reviews `(question, cypher, result)` and judges whether it actually
@@ -1495,9 +1512,10 @@ md("""\
   the final attempt was already mechanically broken.
 - `adaptive_rag=True` (§11) is the RAG-side sibling of `cascade_mode`: it retries a failed/empty
   query from scratch with progressively more retrieved examples ("minimal" → "moderate" → "full",
-  i.e. `n_results` of 1 → the dataset's configured default → every example in the collection),
-  stopping at the first rung that succeeds — mutually exclusive with both `cascade_mode` and
-  `rescue_prompt`/`max_retries` (pick one retry strategy). `result.adaptive_rag_level`/
+  i.e. `n_results` of the dataset's configured default → 2x that → 5x that, each capped at the
+  collection's actual size — never *every* example in the collection), stopping at the first rung
+  that succeeds — mutually exclusive with both `cascade_mode` and `rescue_prompt`/`max_retries`
+  (pick one retry strategy). `result.adaptive_rag_level`/
   `result.adaptive_rag_attempts`/`result.adaptive_rag_prompts`/`result.adaptive_rag_prompt_tokens`
   report which rung was used and what each tried rung cost.
 - Fine-tuning (§12): `load_finetune_levels`/`max_cypher_tokens`/`split_finetune_dataset` prepare a
@@ -1511,6 +1529,10 @@ md("""\
   recorded alongside it and reused automatically at retrieval — `embedding_model` never needs to
   be passed again — and a mismatched `embedding_model` (or a missing `OPENAI_API_KEY` for a
   collection that needs one) raises `ValueError` instead of silently corrupting retrieval.
+- `RAGDataset`'s `chromadb` dependency is an optional extra (`pip install
+  "text2cypher-composer[rag]"`) imported lazily, only inside `RAGDataset` itself — every non-RAG
+  component (`"vanilla"`/`"Schema"`, `cascade_mode`, `rescue_prompt`, `self_verification`, ...)
+  works from the base install alone.
 - The available techniques are listed in `Technique`
   (`from text2cypher_composer import Technique`), or as plain strings via `list_techniques()`.
   `describe_technique()`/`list_technique_info()` tell you what each one needs, and

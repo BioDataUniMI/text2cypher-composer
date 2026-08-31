@@ -1,11 +1,32 @@
+"""RAG example retrieval (`RAGDataset`) backed by Chroma.
+
+`chromadb` is an optional dependency (`pip install "text2cypher-composer[rag]"`) imported lazily,
+only inside the two places that actually need it (`RAGDataset.index_from_root`/`.collection`) —
+so `import text2cypher_composer` and every non-RAG component (schema filtering, `cascade_mode`,
+`rescue_prompt`, `self_verification`, ...) work without it installed at all. See
+`_import_chromadb`.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import chromadb
 from langchain_core.embeddings import Embeddings
+
+
+def _import_chromadb():
+    """Import `chromadb` lazily — an optional dependency (`pip install "text2cypher-composer[rag]"`)
+    only needed by `RAGDataset`, so importing `text2cypher_composer` for non-RAG components
+    (schema filtering, `cascade_mode`, `self_verification`, ...) never requires it."""
+    try:
+        import chromadb
+    except ImportError as e:
+        raise ImportError(
+            "RAGDataset requires the `chromadb` package. Install it with `pip install chromadb` "
+            '(or `pip install "text2cypher-composer[rag]"`).'
+        ) from e
+    return chromadb
 
 from .embeddings import (
     DEFAULT_OPENAI_EMBEDDING_MODEL,
@@ -106,6 +127,8 @@ class RAGDataset:
         Typically run once after `build_rag_example_files()` has populated
         `root/NLquestions/`.
         """
+        chromadb = _import_chromadb()
+
         root = Path(root)
         chroma_path = root / "chroma_db"
         client = chromadb.PersistentClient(path=str(chroma_path))
@@ -177,6 +200,7 @@ class RAGDataset:
     @property
     def collection(self):
         if self._collection is None:
+            chromadb = _import_chromadb()
             client = chromadb.PersistentClient(path=str(self.chroma_path))
             self._collection = client.get_collection(name=self.collection_name)
         return self._collection
@@ -270,21 +294,32 @@ def resolve_adaptive_rag_levels(
 ) -> List[Tuple[RAGExpansionLevel, Dict[str, Any]]]:
     """Resolve the retrieved examples for each rung of the `adaptive_rag` cascade, in order.
 
-    Returns `[(level, retrieved), ...]`, retrieving progressively more
-    examples: `RAGExpansionLevel.MINIMAL` (a single example), `.MODERATE`
-    (`dataset.n_results` examples — today's default), then always
-    `RAGExpansionLevel.FULL` last (every example in the collection). Each
-    `retrieved` dict is exactly what `RAGDataset.retrieve_examples` returns
-    (`examples_text`/`example_ids`/`example_distances`). No LLM calls
-    involved — this is the RAG-side sibling of
-    `schema_modes.resolve_cascade_mode_levels`.
+    Returns `[(level, retrieved), ...]`, retrieving progressively more examples, all sized off
+    `dataset.n_results` and capped at the collection's actual size — never "every example in the
+    collection", which for a real RAG dataset (hundreds/thousands of examples) would blow the
+    prompt budget for no benefit:
+
+    - `RAGExpansionLevel.MINIMAL`: `dataset.n_results` itself — today's normal, non-adaptive
+      retrieval count, so `adaptive_rag`'s first try is identical to what a plain (non-adaptive)
+      call would retrieve.
+    - `RAGExpansionLevel.MODERATE`: `min(2 * dataset.n_results, collection.count())`.
+    - `RAGExpansionLevel.FULL`: `min(5 * dataset.n_results, collection.count())` — the largest of
+      the three, but still a real, bounded cap.
+
+    This is safe/informative by construction, not just "bigger": Chroma's top-k nearest-neighbor
+    retrieval is deterministic and monotonic (top-3 is always a strict prefix of top-6, top-6 of
+    top-12, ...), so a later rung's larger `n_results` only ever *adds* new, still-relevant
+    (similarity-ranked) examples on top of an earlier rung's — never duplicates or reorders them.
+    Each `retrieved` dict is exactly what `RAGDataset.retrieve_examples` returns
+    (`examples_text`/`example_ids`/`example_distances`). No LLM calls involved — this is the
+    RAG-side sibling of `schema_modes.resolve_cascade_mode_levels`.
     """
     total_examples = dataset.collection.count()
     return [
         (level, dataset.retrieve_examples(question, with_output, n_results=n))
         for level, n in (
-            (RAGExpansionLevel.MINIMAL, 1),
-            (RAGExpansionLevel.MODERATE, dataset.n_results),
-            (RAGExpansionLevel.FULL, total_examples),
+            (RAGExpansionLevel.MINIMAL, dataset.n_results),
+            (RAGExpansionLevel.MODERATE, min(2 * dataset.n_results, total_examples)),
+            (RAGExpansionLevel.FULL, min(5 * dataset.n_results, total_examples)),
         )
     ]

@@ -177,13 +177,17 @@ class RAGExpansionLevel(str, Enum):
     """A rung of the `adaptive_rag` cascade (see `run()`'s `adaptive_rag` argument).
 
     The RAG-side sibling of `CascadeModeLevel`: instead of progressively
-    less pruned schema, each rung retrieves progressively more RAG examples.
+    less pruned schema, each rung retrieves progressively more RAG examples
+    — all sized off `RAGDataset.n_results` and capped at the collection's
+    actual size (never "every example in the collection", which for a real
+    RAG dataset could be hundreds/thousands of examples). See
+    `rag.resolve_adaptive_rag_levels`.
 
-    - "minimal": a single retrieved example (`n_results=1`).
-    - "moderate": `RAGDataset.n_results` examples — today's default retrieval
-      behavior.
-    - "full": every example in the collection (`n_results=collection.count()`)
-      — the final fallback, always tried last.
+    - "minimal": `RAGDataset.n_results` examples — today's normal,
+      non-adaptive retrieval count.
+    - "moderate": `min(2 * n_results, collection.count())`.
+    - "full": `min(5 * n_results, collection.count())` — the largest of the
+      three, always tried last, but still a real, bounded cap.
     """
 
     MINIMAL = "minimal"
