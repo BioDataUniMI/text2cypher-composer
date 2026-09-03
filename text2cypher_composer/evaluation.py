@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import pandas as pd
 
@@ -16,6 +16,13 @@ from .metrics import (
     jaccard_similarity,
     jaro_winkler_similarity,
     normalized_levenshtein_similarity,
+)
+from .techniques import (
+    CascadeStrategy,
+    CascadeStrategyLike,
+    DEFAULT_SCHEMA_COMPONENTS,
+    SchemaComponentLike,
+    SchemaModeLike,
 )
 
 
@@ -38,6 +45,15 @@ class QuestionEvaluation:
     likewise proxy the first attempt's, only meaningful when
     `evaluate_technique` was called with `self_verification=True` (`None`
     otherwise, or if the first attempt was already mechanically broken).
+
+    `cascade_mode_level`/`cascade_mode_attempts`/`cascade_mode_prompts`/
+    `cascade_mode_prompt_tokens` and `adaptive_rag_level`/
+    `adaptive_rag_attempts`/`adaptive_rag_prompts`/`adaptive_rag_prompt_tokens`
+    likewise proxy the first attempt's (see `Text2CypherResult`) — only
+    meaningful when `evaluate_technique` was called with `cascade_mode=True`
+    or `adaptive_rag=True` respectively (`None`/`0`/empty otherwise; `run()`
+    itself keeps the two mutually exclusive, so at most one set is ever
+    populated for a given evaluation).
     """
 
     question: str
@@ -94,6 +110,38 @@ class QuestionEvaluation:
     def self_verification_reasoning(self) -> Optional[str]:
         return self.attempts[0].self_verification_reasoning
 
+    @property
+    def cascade_mode_level(self) -> Optional[str]:
+        return self.attempts[0].cascade_mode_level
+
+    @property
+    def cascade_mode_attempts(self) -> int:
+        return self.attempts[0].cascade_mode_attempts
+
+    @property
+    def cascade_mode_prompts(self) -> List[List[Dict[str, str]]]:
+        return self.attempts[0].cascade_mode_prompts
+
+    @property
+    def cascade_mode_prompt_tokens(self) -> List[Optional[int]]:
+        return self.attempts[0].cascade_mode_prompt_tokens
+
+    @property
+    def adaptive_rag_level(self) -> Optional[str]:
+        return self.attempts[0].adaptive_rag_level
+
+    @property
+    def adaptive_rag_attempts(self) -> int:
+        return self.attempts[0].adaptive_rag_attempts
+
+    @property
+    def adaptive_rag_prompts(self) -> List[List[Dict[str, str]]]:
+        return self.attempts[0].adaptive_rag_prompts
+
+    @property
+    def adaptive_rag_prompt_tokens(self) -> List[Optional[int]]:
+        return self.attempts[0].adaptive_rag_prompt_tokens
+
 
 @dataclass
 class EvaluationSummary:
@@ -138,7 +186,14 @@ class EvaluationReport:
         `self_verification_reasoning` (the first attempt's semantic verdict
         and its reasoning, when `evaluate_technique` was called with
         `self_verification=True` — both `None` otherwise, or if the first
-        attempt was already mechanically broken); and
+        attempt was already mechanically broken); `cascade_mode_level`/
+        `cascade_mode_attempts`/`cascade_mode_prompts`/
+        `cascade_mode_prompt_tokens` and `adaptive_rag_level`/
+        `adaptive_rag_attempts`/`adaptive_rag_prompts`/
+        `adaptive_rag_prompt_tokens` (which rung was used, how many were
+        tried, and each tried rung's prompt/token count, when
+        `evaluate_technique` was called with `cascade_mode=True` or
+        `adaptive_rag=True` respectively — `None`/`0`/empty otherwise); and
         `retrieved_example_ids`/`retrieved_example_distances` for RAG
         techniques (`None` otherwise) — see
         `Text2CypherResult.retrieved_examples`.
@@ -175,6 +230,14 @@ class EvaluationReport:
             row["rescue_prompt_tokens"] = first.rescue_prompt_tokens
             row["self_verification_passed"] = first.self_verification_passed
             row["self_verification_reasoning"] = first.self_verification_reasoning
+            row["cascade_mode_level"] = first.cascade_mode_level
+            row["cascade_mode_attempts"] = first.cascade_mode_attempts
+            row["cascade_mode_prompts"] = first.cascade_mode_prompts
+            row["cascade_mode_prompt_tokens"] = first.cascade_mode_prompt_tokens
+            row["adaptive_rag_level"] = first.adaptive_rag_level
+            row["adaptive_rag_attempts"] = first.adaptive_rag_attempts
+            row["adaptive_rag_prompts"] = first.adaptive_rag_prompts
+            row["adaptive_rag_prompt_tokens"] = first.adaptive_rag_prompt_tokens
             row["retrieved_example_ids"] = retrieved.get("example_ids")
             row["retrieved_example_distances"] = retrieved.get("example_distances")
             rows.append(row)
@@ -194,6 +257,15 @@ def evaluate_technique(
     self_verification: bool = False,
     verification_model: Optional[ModelLike] = None,
     verification_criteria: Optional[str] = None,
+    schema_mode: Optional[SchemaModeLike] = None,
+    schema_components: Iterable[SchemaComponentLike] = DEFAULT_SCHEMA_COMPONENTS,
+    nlp: Optional[Any] = None,
+    similarity_threshold: float = 0.5,
+    ie_engine: Optional[Any] = None,
+    cascade_mode: bool = False,
+    skip_narrow_schema_filter: bool = False,
+    cascade_strategy: CascadeStrategyLike = CascadeStrategy.STANDARD,
+    adaptive_rag: bool = False,
 ) -> EvaluationReport:
     """Evaluate `technique` in bulk over a gold (question, query) test set.
 
@@ -241,6 +313,39 @@ def evaluate_technique(
             actually answers the question, folding a failed verdict into
             the same retry decision `rescue_prompt` already makes. See
             `run()`'s `self_verification` for details.
+        schema_mode, schema_components, nlp, similarity_threshold, ie_engine:
+            forwarded to `run()` for every attempt (default `None`/entity
+            types only/`None`/`0.5`/`None`, same as `run()`) — how the
+            schema is derived/pruned for a schema-using `technique`. See
+            `run()`'s `schema_mode`/`schema_components`/`nlp`/
+            `similarity_threshold`/`ie_engine` for their meaning and
+            constraints (e.g. `nlp` required by `schema_mode=
+            "ner_exact_match"`/`"similarity"`, `ie_engine` required by
+            `"ie_extraction"`).
+        cascade_mode, skip_narrow_schema_filter, cascade_strategy: forwarded
+            to `run()` for every attempt (default `False`/`False`/
+            `"standard"`) — retries an attempt that fails to execute or
+            comes back empty from scratch with progressively less aggressive
+            schema pruning, instead of `rescue_prompt`'s error-aware fix-up
+            (the two are mutually exclusive — `run()` raises `ValueError` if
+            both are requested). See `run()`'s `cascade_mode`/
+            `skip_narrow_schema_filter`/`cascade_strategy` for the rungs
+            tried and what `cascade_strategy="delta"` changes.
+            `QuestionEvaluation.cascade_mode_level`/`.cascade_mode_attempts`/
+            `.cascade_mode_prompts`/`.cascade_mode_prompt_tokens` (and the
+            matching `to_dataframe()` columns) report, per question, which
+            rung the first attempt used, how many were tried, and each
+            tried rung's prompt/token count.
+        adaptive_rag: forwarded to `run()` for every attempt (default
+            `False`) — the RAG-side sibling of `cascade_mode`: retries a
+            failed/empty attempt from scratch with progressively more
+            retrieved RAG examples instead of un-pruning the schema.
+            Mutually exclusive with `cascade_mode`/`rescue_prompt` (`run()`
+            raises `ValueError` if combined). See `run()`'s `adaptive_rag`
+            for details. `QuestionEvaluation.adaptive_rag_level`/
+            `.adaptive_rag_attempts`/`.adaptive_rag_prompts`/
+            `.adaptive_rag_prompt_tokens` (and the matching `to_dataframe()`
+            columns) are its `cascade_mode_*` siblings above.
 
     Returns:
         An EvaluationReport: a dataset-level `summary` (mean metrics plus
@@ -280,6 +385,15 @@ def evaluate_technique(
                 self_verification=self_verification,
                 verification_model=verification_model,
                 verification_criteria=verification_criteria,
+                schema_mode=schema_mode,
+                schema_components=schema_components,
+                nlp=nlp,
+                similarity_threshold=similarity_threshold,
+                ie_engine=ie_engine,
+                cascade_mode=cascade_mode,
+                skip_narrow_schema_filter=skip_narrow_schema_filter,
+                cascade_strategy=cascade_strategy,
+                adaptive_rag=adaptive_rag,
             )
             attempts.append(result)
             pred_data = result.result if result.executed else []

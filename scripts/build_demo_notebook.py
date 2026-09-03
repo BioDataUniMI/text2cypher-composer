@@ -1452,6 +1452,42 @@ eval_df[[
 """)
 
 md("""\
+### 14.1 Bulk-evaluating schema filtering and `cascade_mode`/`adaptive_rag`
+
+`evaluate_technique` forwards every schema-filtering and retry-strategy argument `run()` takes --
+`schema_mode`/`schema_components`/`nlp`/`similarity_threshold`/`ie_engine` (§4), `cascade_mode`/
+`skip_narrow_schema_filter`/`cascade_strategy` (§9/§9.1), and `adaptive_rag` (§11) -- to every
+attempt, exactly like it already forwards `rescue_prompt`/`max_retries` above. This is what lets a
+bulk evaluation actually exercise a pruning `schema_mode` or a cascade strategy across a whole gold
+set, not just a single `run()` call:
+""")
+
+code("""\
+report_cascade = evaluate_technique(
+    gold_df,
+    model="gpt-4o",
+    database=database,
+    technique="Schema",
+    schema_mode="exact_match",
+    cascade_mode=True,
+    cascade_strategy="delta",
+)
+
+print(report_cascade.summary)
+""")
+
+md("""\
+`report.to_dataframe()` then also carries `cascade_mode_level`/`cascade_mode_attempts`/
+`cascade_mode_prompts`/`cascade_mode_prompt_tokens` per question (their `adaptive_rag_*` siblings
+when `adaptive_rag=True` is used instead) -- the same per-rung diagnostics `Text2CypherResult`
+reports for a single `run()` call, now available across the whole gold set:
+""")
+
+code("""\
+report_cascade.to_dataframe()[["question", "cascade_mode_level", "cascade_mode_attempts", "cascade_mode_prompt_tokens"]]
+""")
+
+md("""\
 ## 15. Summary
 
 - `run()` always returns a `Text2CypherResult` with: `question`, `technique`, `model`,
@@ -1552,11 +1588,17 @@ md("""\
   `get_prompt_template()`/`get_all_prompt_templates()` show its unfilled prompt (§13).
 - `evaluate_technique()` (§14) runs a technique over a gold test set and reports
   Jaro-Winkler, Levenshtein, Jaccard, Coverage, and pass@k as an `EvaluationReport`
-  (`.summary` for dataset-level averages, `.to_dataframe()` for a per-question table).
-  `rescue_prompt`/`max_retries` forward to every attempt, and `.to_dataframe()`/
+  (`.summary` for dataset-level averages, `.to_dataframe()` for a per-question table). It forwards
+  every argument `run()` takes to every attempt -- `schema_mode`/`schema_components`/`nlp`/
+  `similarity_threshold`/`ie_engine`, `rescue_prompt`/`max_retries`, `cascade_mode`/
+  `skip_narrow_schema_filter`/`cascade_strategy`, `adaptive_rag`, and `self_verification`/
+  `verification_model`/`verification_criteria` (§14.1) -- so a bulk evaluation can exercise the
+  same schema-filtering/retry-strategy behavior a single `run()` call can. `.to_dataframe()`/
   `save_evaluation_report()`'s `.pkl`/`.xlsx` then carry `execution_error`/`execution_warnings`,
-  `rescued`/`rescue_attempts`/`rescue_error_messages`/`rescue_prompts`, and
-  `prompt_tokens`/`rescue_prompt_tokens` per question.
+  `rescued`/`rescue_attempts`/`rescue_error_messages`/`rescue_prompts`/`rescue_prompt_tokens`,
+  `self_verification_passed`/`self_verification_reasoning`, and `cascade_mode_level`/
+  `cascade_mode_attempts`/`cascade_mode_prompts`/`cascade_mode_prompt_tokens` (`adaptive_rag_*`
+  siblings when `adaptive_rag=True` is used instead) per question.
 """)
 
 nb["cells"] = cells

@@ -957,6 +957,23 @@ print(report.summary)
 report.to_dataframe()  # one row per question, with a pass@1/pass@2/pass@3 column each
 ```
 
+To bulk-evaluate schema filtering and `cascade_mode`/`adaptive_rag` — not just `technique` — pass the
+same arguments `run()` takes; `evaluate_technique` forwards them to every attempt:
+
+```python
+report = evaluate_technique(
+    gold_df,
+    model="gpt-4o",
+    database={},
+    technique="Schema",
+    schema_mode="exact_match",       # any pruning schema_mode `run()` accepts
+    cascade_mode=True,
+    cascade_strategy="delta",        # the "Incremental delta cascade" — see `cascade_strategy` above
+)
+
+report.to_dataframe()["cascade_mode_level"]  # which rung ("narrow"/"nodes_only"/"full") each question resolved at
+```
+
 For each question, `k` independent Cypher completions are generated (via
 `run()`, so every attempt goes through the full technique pipeline —
 schema/RAG retrieval, execution, CyVer validation) and compared against the
@@ -975,10 +992,20 @@ text: since Neo4j doesn't guarantee row order without `ORDER BY`, rows are
 greedily bipartite-matched by similarity before being compared whenever the
 gold query has none.
 
-`evaluate_technique` also forwards `rescue_prompt`/`max_retries` (default `False`/`1`),
-`cache_schema` (default `True`), and `self_verification`/`verification_model`/
-`verification_criteria` (default `False`/`None`/`None`, requires `rescue_prompt=True`) — all same
-defaults as `run()` — to every attempt.
+`evaluate_technique` also forwards, to every attempt, every schema-filtering and retry-strategy
+argument `run()` takes — same names, same defaults:
+
+- `schema_mode`/`schema_components`/`nlp`/`similarity_threshold`/`ie_engine` — how the schema is
+  derived/pruned for a schema-using `technique` (see `schema_mode` above). This is what lets a
+  bulk evaluation actually exercise schema filtering — passing none of these evaluates with the
+  plain, unpruned schema (`run()`'s own default), same as before this was added.
+- `rescue_prompt`/`max_retries` (default `False`/`1`), `cache_schema` (default `True`), and
+  `self_verification`/`verification_model`/`verification_criteria` (default `False`/`None`/`None`,
+  requires `rescue_prompt=True`).
+- `cascade_mode`/`skip_narrow_schema_filter`/`cascade_strategy` (default `False`/`False`/
+  `"standard"`) and `adaptive_rag` (default `False`) — the two retry-from-scratch strategies (see
+  `cascade_mode` and `adaptive_rag` above); mutually exclusive with each other and with
+  `rescue_prompt`, same as `run()` enforces.
 
 Besides the metric/pass@j columns, `report.to_dataframe()` also carries, per question: any
 columns `gold_df` had beyond `question`/`query` (e.g. bio2C's `"ID"`/`"level"`, if you built
@@ -990,10 +1017,16 @@ across `technique`/`schema_mode` rows to see how many tokens schema filtering sa
 execution, populated regardless of `rescue_prompt`), `rescued`/`rescue_attempts` (whether — and
 how many retries — the first attempt needed to stop failing/coming back empty, when
 `rescue_prompt=True`; `False`/`0` otherwise), `rescue_error_messages`/`rescue_prompts` (the
-`error_message`/fully-instantiated messages sent for each retry) and `rescue_prompt_tokens`
+`error_message`/fully-instantiated messages sent for each retry), `rescue_prompt_tokens`
 (their token counts, to tally how many extra tokens `rescue_prompt` costs across the whole gold
-set), and `retrieved_example_ids`/`retrieved_example_distances` for RAG techniques (`None`
-otherwise).
+set), `self_verification_passed`/`self_verification_reasoning` (the first attempt's semantic
+verdict and its reasoning, when `self_verification=True` — both `None` otherwise, or if the first
+attempt was already mechanically broken), `cascade_mode_level`/`cascade_mode_attempts`/
+`cascade_mode_prompts`/`cascade_mode_prompt_tokens` and `adaptive_rag_level`/
+`adaptive_rag_attempts`/`adaptive_rag_prompts`/`adaptive_rag_prompt_tokens` (which rung the first
+attempt used, how many were tried, and each tried rung's prompt/token count, when
+`cascade_mode=True`/`adaptive_rag=True` respectively — `None`/`0`/empty otherwise), and
+`retrieved_example_ids`/`retrieved_example_distances` for RAG techniques (`None` otherwise).
 
 **`save_evaluation_report` persists a report as a `.pkl`/`.xlsx` pair**, one per (model,
 technique) — named `evaluating_text2cypher_{model}_{technique}.{pkl,xlsx}`:
