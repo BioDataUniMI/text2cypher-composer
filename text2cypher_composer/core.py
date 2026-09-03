@@ -462,19 +462,20 @@ def run(
             node labels matched) → `"full"`, each rung a fresh,
             self-contained prompt carrying that rung's *entire* schema.
             `"delta"` — the "Incremental delta cascade" — changes two
-            things: (1) the second rung becomes `"expansion_2hop"` instead
-            of `"nodes_only"` pruning — `narrow`'s node labels expanded 2
-            hops out over the full schema treated as a graph of labels
-            connected by relationships (see `schema_modes.
-            two_hop_expansion_prune`), purely structural and independent of
-            `schema_mode`; (2) every rung still gets a fresh, independent,
-            self-contained prompt (no reference to a previous rung's query
-            or failure — deliberately *not* `rescue_prompt`-style, so the
-            schema-expansion effect can be studied in isolation from
-            `rescue_prompt`'s error-aware correction), but its
-            `enhanced_schema` is only the elements not already shown at a
-            previous rung (see `schema_modes.schema_delta`) — cutting
-            redundant schema tokens repeated across rungs. Requires
+            things: (1) `"narrow"` is additionally tightened to only the
+            top-2 relationship patterns per node-label pair, ranked by
+            lexical similarity to the question (see `schema_modes.
+            narrow_top2_relationships` — "true_narrow_top2"); (2) every rung
+            still gets a fresh, independent, self-contained prompt (no
+            reference to a previous rung's query or failure — deliberately
+            *not* `rescue_prompt`-style), but a rung after the first shows a
+            compact inventory of everything a previous rung already showed
+            (label/type/property names only, no examples) plus only the
+            schema elements newly introduced at this rung (see
+            `schema_modes.schema_delta`/`schema_modes._format_seen_schema`)
+            — avoiding both repeating the full schema already sent in a
+            failed earlier rung, and showing only the new elements with no
+            memory of what the model already saw. Requires
             `cascade_mode=True` — `run()` raises `ValueError` if
             `cascade_strategy="delta"` is passed with `cascade_mode=False`.
         adaptive_rag: if True, an attempt that fails to execute or comes
@@ -753,10 +754,10 @@ def run(
         # cascade_mode and rescue_prompt are mutually exclusive (validated above), so every
         # rung here is a single clean, self-contained attempt, never followed by an error-aware
         # fix-up retry -- this holds for both cascade_strategy values. "delta" only changes what
-        # resolve_cascade_mode_levels puts in schema_levels (a 2-hop structural expansion for the
-        # second rung, and each rung's text limited to what wasn't already shown at a previous
-        # one), not how a rung is generated here — keeping the schema-expansion effect isolated
-        # from any rescue-style correction dynamic.
+        # resolve_cascade_mode_levels puts in schema_levels (a top-2 relationship trim on the
+        # first rung, and each later rung's text limited to a compact inventory of what was
+        # already shown plus what's newly introduced), not how a rung is generated here --
+        # keeping the schema-expansion effect isolated from any rescue-style correction dynamic.
         for i, (level, level_schema_text) in enumerate(schema_levels):
             level_kwargs = {**format_kwargs, "enhanced_schema": level_schema_text}
             attempt = _generate_execute_and_rescue(

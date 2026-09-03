@@ -6,11 +6,14 @@ from langchain_core.runnables import RunnableLambda
 from text2cypher_composer.schema import format_schema
 from text2cypher_composer.schema_modes import (
     SchemaSelection,
+    _format_seen_schema,
+    _merge_structured,
     exact_match_prune,
     expand_labels_by_hops,
     llm_prune,
     llm_prune_nodes_only,
     mask_entities,
+    narrow_top2_relationships,
     ner_exact_match_prune,
     resolve_cascade_mode_levels,
     resolve_schema_text,
@@ -19,7 +22,7 @@ from text2cypher_composer.schema_modes import (
     similarity_prune_nodes_only,
     two_hop_expansion_prune,
 )
-from text2cypher_composer.techniques import CascadeModeLevel
+from text2cypher_composer.techniques import ALL_SCHEMA_COMPONENTS, DEFAULT_SCHEMA_COMPONENTS, CascadeModeLevel
 
 STRUCTURED_SCHEMA = {
     "node_props": {
@@ -302,6 +305,120 @@ def test_schema_delta_relationship_properties_narrowed_to_new_only():
     assert delta["rel_props"] == {"TRANSCRIBED_TO": [{"property": "confidence", "type": "FLOAT"}]}
 
 
+_MULTI_REL_SCHEMA = {
+    "node_props": {
+        "Person": [{"property": "name", "type": "STRING"}],
+        "Movie": [{"property": "title", "type": "STRING"}],
+    },
+    "relationships": [
+        {"start": "Person", "type": "DIRECTED", "end": "Movie"},
+        {"start": "Person", "type": "ACTED_IN", "end": "Movie"},
+        {"start": "Person", "type": "REVIEWED", "end": "Movie"},
+        {"start": "Person", "type": "PRODUCED", "end": "Movie"},
+    ],
+    "rel_props": {
+        "DIRECTED": [{"property": "year", "type": "INTEGER"}],
+        "ACTED_IN": [{"property": "role", "type": "STRING"}],
+        "REVIEWED": [{"property": "rating", "type": "INTEGER"}],
+        "PRODUCED": [{"property": "budget", "type": "FLOAT"}],
+    },
+    "metadata": {},
+}
+
+
+def test_narrow_top2_relationships_keeps_only_the_top2_most_lexically_similar_per_pair():
+    pruned = narrow_top2_relationships(_MULTI_REL_SCHEMA, "Who acted in and reviewed this movie?")
+    kept_types = {r["type"] for r in pruned["relationships"]}
+    # ACTED_IN and REVIEWED both share tokens with the question -- DIRECTED/PRODUCED don't
+    assert kept_types == {"ACTED_IN", "REVIEWED"}
+    assert set(pruned["rel_props"].keys()) == {"ACTED_IN", "REVIEWED"}
+
+
+def test_narrow_top2_relationships_leaves_a_pair_with_top_k_or_fewer_patterns_untouched():
+    schema = {
+        "node_props": {"A": [], "B": []},
+        "relationships": [{"start": "A", "type": "R1", "end": "B"}],
+        "rel_props": {},
+        "metadata": {},
+    }
+    pruned = narrow_top2_relationships(schema, "anything")
+    assert pruned["relationships"] == schema["relationships"]
+
+
+def test_narrow_top2_relationships_ranks_independently_per_endpoint_pair():
+    schema = {
+        "node_props": {},
+        "relationships": [
+            {"start": "A", "type": "REL_ONE", "end": "B"},
+            {"start": "A", "type": "REL_TWO", "end": "B"},
+            {"start": "A", "type": "REL_THREE", "end": "B"},
+            {"start": "C", "type": "REL_FOUR", "end": "D"},
+        ],
+        "rel_props": {},
+        "metadata": {},
+    }
+    pruned = narrow_top2_relationships(schema, "no lexical overlap with any type")
+    kept_types = {r["type"] for r in pruned["relationships"]}
+    # A->B keeps its top 2 (ties broken by original order); C->D's only pattern is untouched
+    assert kept_types == {"REL_ONE", "REL_TWO", "REL_FOUR"}
+
+
+def test_narrow_top2_relationships_leaves_node_props_untouched():
+    pruned = narrow_top2_relationships(_MULTI_REL_SCHEMA, "Who acted in this movie?")
+    assert pruned["node_props"] == _MULTI_REL_SCHEMA["node_props"]
+
+
+def test_merge_structured_unions_node_relationship_and_rel_props():
+    a = {
+        "node_props": {"NodeA": [{"property": "x", "type": "STRING"}]},
+        "relationships": [{"start": "NodeA", "type": "R1", "end": "NodeB"}],
+        "rel_props": {"R1": [{"property": "p", "type": "STRING"}]},
+        "metadata": {},
+    }
+    b = {
+        "node_props": {
+            "NodeA": [{"property": "y", "type": "INTEGER"}],  # new property for a shared label
+            "NodeC": [{"property": "z", "type": "STRING"}],  # a whole new label
+        },
+        "relationships": [
+            {"start": "NodeA", "type": "R1", "end": "NodeB"},  # duplicate, not repeated
+            {"start": "NodeB", "type": "R2", "end": "NodeC"},
+        ],
+        "rel_props": {"R1": [{"property": "p", "type": "STRING"}], "R2": []},
+        "metadata": {},
+    }
+    merged = _merge_structured(a, b)
+    assert merged["node_props"]["NodeA"] == [
+        {"property": "x", "type": "STRING"},
+        {"property": "y", "type": "INTEGER"},
+    ]
+    assert merged["node_props"]["NodeC"] == [{"property": "z", "type": "STRING"}]
+    assert merged["relationships"] == [
+        {"start": "NodeA", "type": "R1", "end": "NodeB"},
+        {"start": "NodeB", "type": "R2", "end": "NodeC"},
+    ]
+    assert set(merged["rel_props"].keys()) == {"R1", "R2"}
+
+
+def test_format_seen_schema_is_empty_for_an_empty_schema():
+    empty = {"node_props": {}, "relationships": [], "rel_props": {}, "metadata": {}}
+    assert _format_seen_schema(empty) == ""
+
+
+def test_format_seen_schema_uses_the_compact_non_enhanced_style():
+    seen = {
+        "node_props": {"NodeA": [{"property": "Label", "type": "STRING"}]},
+        "relationships": [],
+        "rel_props": {},
+        "metadata": {},
+    }
+    text = _format_seen_schema(seen)
+    assert "Schema already shown" in text
+    # the terse `NodeA {Label: STRING}` style, not the enhanced `- **NodeA**` bullet style
+    assert "NodeA {Label: STRING}" in text
+    assert "- **NodeA**" not in text
+
+
 CHAIN_SCHEMA = {
     "node_props": {
         "NodeA": [{"property": "Label", "type": "STRING"}],
@@ -355,59 +472,99 @@ _CHAIN_NARROW = {
     "metadata": {},
 }
 
+_CHAIN_NODES_ONLY = {
+    "node_props": {
+        "NodeA": [{"property": "Label", "type": "STRING"}],
+        "NodeB": [{"property": "Label", "type": "STRING"}],
+        "NodeC": [{"property": "Label", "type": "STRING"}],
+    },
+    "relationships": [
+        {"start": "NodeA", "type": "REL_AB", "end": "NodeB"},
+        {"start": "NodeB", "type": "REL_BC", "end": "NodeC"},
+    ],
+    "rel_props": {},
+    "metadata": {},
+}
+
+
+def _fake_narrow_vs_nodes_only(_structured_schema, _question, components=DEFAULT_SCHEMA_COMPONENTS):
+    """Distinguishes `resolve_cascade_mode_levels`'s two `exact_match_prune` calls by the
+    `components` they're given -- `ALL_SCHEMA_COMPONENTS` for "narrow", `DEFAULT_SCHEMA_COMPONENTS`
+    for "nodes_only" -- so each rung's fixture is independently controllable, unlike a single
+    `return_value` mock (which can't tell the two calls apart)."""
+    return _CHAIN_NARROW if components == ALL_SCHEMA_COMPONENTS else _CHAIN_NODES_ONLY
+
 
 def test_resolve_cascade_mode_levels_delta_first_rung_is_full_narrow_schema():
     with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", return_value=_CHAIN_NARROW):
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_narrow_vs_nodes_only):
         levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
 
+    # _CHAIN_NARROW has no relationships, so the top-2-per-pair trim is a no-op here
     assert levels[0][1] == format_schema(_CHAIN_NARROW, is_enhanced=True)
 
 
-def test_resolve_cascade_mode_levels_delta_second_rung_is_a_two_hop_expansion():
+def test_resolve_cascade_mode_levels_delta_second_rung_is_a_compact_inventory_plus_delta():
     with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", return_value=_CHAIN_NARROW):
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_narrow_vs_nodes_only):
         levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
 
     nodes_only_text = levels[1][1]
-    node_props_section = nodes_only_text.split("The relationships:")[0]
-    # NodeB/NodeC are within 2 hops of NodeA (the narrow rung's only label) -- new at this rung
-    assert "NodeB" in node_props_section
-    assert "NodeC" in node_props_section
-    # NodeA was already shown at the narrow rung -- not repeated
-    assert "NodeA" not in node_props_section
-    # NodeD is 3 hops away -- outside the 2-hop expansion entirely
+    # a compact reminder that NodeA was already shown at the narrow rung ...
+    assert "Schema already shown" in nodes_only_text
+    assert "NodeA" in nodes_only_text
+    # ... plus the elements nodes_only adds on top of it, shown in full
+    assert "Additional schema" in nodes_only_text
+    assert "NodeB" in nodes_only_text
+    assert "NodeC" in nodes_only_text
+    assert "REL_AB" in nodes_only_text
+    assert "REL_BC" in nodes_only_text
+    # NodeD/NodeE are outside nodes_only's own selection entirely -- not this rung's job
     assert "NodeD" not in nodes_only_text
+    assert "NodeE" not in nodes_only_text
 
 
-def test_resolve_cascade_mode_levels_delta_third_rung_shows_what_the_two_hop_expansion_missed():
+def test_resolve_cascade_mode_levels_delta_third_rung_shows_what_nodes_only_missed():
     with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", return_value=_CHAIN_NARROW):
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_narrow_vs_nodes_only):
         levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
 
     full_text = levels[2][1]
-    node_props_section = full_text.split("The relationships:")[0]
-    # NodeD (3 hops away) and NodeE (disconnected) are outside the 2-hop expansion -- new here
-    assert "NodeD" in node_props_section
-    assert "NodeE" in node_props_section
-    assert "NodeA" not in node_props_section
-    assert "NodeB" not in node_props_section
-    assert "NodeC" not in node_props_section
+    # NodeD (never reached) and NodeE (disconnected) are new at the full rung
+    assert "NodeD" in full_text
+    assert "NodeE" in full_text
+    assert "REL_CD" in full_text
+    # everything narrow + nodes_only already showed (across *both* previous rungs, not just the
+    # immediately previous one) is reminded via the compact inventory, not repeated in full
+    assert "Schema already shown" in full_text
+    delta_section = full_text.split("Additional schema")[1]
+    delta_node_props_section = delta_section.split("The relationships:")[0]
+    # NodeA/NodeB/NodeC's own entries aren't repeated -- REL_AB/REL_BC aren't either, though
+    # NodeC still shows up naturally as REL_CD's start endpoint, a genuinely new relationship
+    assert "NodeA" not in delta_node_props_section
+    assert "NodeB" not in delta_node_props_section
+    assert "NodeC" not in delta_node_props_section
+    assert "REL_AB" not in delta_section
+    assert "REL_BC" not in delta_section
 
 
-def test_resolve_cascade_mode_levels_delta_skip_narrow_still_seeds_the_two_hop_expansion():
+def test_resolve_cascade_mode_levels_delta_skip_narrow_starts_at_nodes_only():
     with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", return_value=_CHAIN_NARROW):
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_narrow_vs_nodes_only):
         levels = resolve_cascade_mode_levels(
             MagicMock(), "exact_match", "some question", strategy="delta", skip_narrow=True
         )
 
     assert [level for level, _ in levels] == [CascadeModeLevel.NODES_ONLY, CascadeModeLevel.FULL]
-    # narrow is never emitted as its own rung, but its label (NodeA) still seeded the expansion --
-    # the first emitted rung is shown in full (nothing before it to delta against)
+    # narrow is never computed/emitted -- the first emitted rung is nodes_only, shown in full
+    # (nothing shown before it to delta against or hold back)
     first_text = levels[0][1]
-    assert "NodeA" in first_text and "NodeB" in first_text and "NodeC" in first_text
+    assert first_text == format_schema(_CHAIN_NODES_ONLY, is_enhanced=True)
     assert "NodeD" not in first_text
+
+    second_text = levels[1][1]
+    assert "NodeD" in second_text and "NodeE" in second_text
+    assert "Schema already shown" in second_text
 
 
 def test_resolve_cascade_mode_levels_rejects_non_pruning_modes():

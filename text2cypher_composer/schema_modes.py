@@ -55,6 +55,14 @@ def _mentioned(term: str, question_tokens: List[str], min_len: int = 2) -> bool:
     return any(tok in term_norm for tok in question_tokens if len(tok) >= min_len)
 
 
+def _lexical_overlap_score(term: str, question_tokens: Iterable[str]) -> int:
+    """How many normalized tokens `term` shares with `question_tokens` -- a cheap, dependency-free
+    lexical similarity used to rank relationship patterns for `narrow_top2_relationships`. Unlike
+    `_mentioned` (substring containment, used to decide inclusion/exclusion), this returns a score
+    used to rank/order candidates that are already all included."""
+    return len(set(_normalize_tokens(term)) & set(question_tokens))
+
+
 def _normalize_components(components: Iterable[SchemaComponentLike]) -> "set[SchemaComponent]":
     return {SchemaComponent(c) for c in components}
 
@@ -186,6 +194,78 @@ def schema_delta(new: Dict[str, Any], old: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _merge_props(
+    a: Dict[str, List[Dict[str, Any]]], b: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Union two label/type -> properties mappings: `b`'s properties are appended to `a`'s for a
+    shared key (deduplicated by property name), `a`'s order wins on ties. Used by
+    `_merge_structured`."""
+    merged: Dict[str, List[Dict[str, Any]]] = {k: list(v) for k, v in a.items()}
+    for key, props in b.items():
+        if key not in merged:
+            merged[key] = props
+        else:
+            seen_names = {p.get("property") for p in merged[key]}
+            merged[key] = merged[key] + [p for p in props if p.get("property") not in seen_names]
+    return merged
+
+
+def _merge_structured(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """Union two structured schemas -- used by `resolve_cascade_mode_levels`'s
+    `strategy=CascadeStrategy.DELTA` to track everything a cascade has shown across *all* previous
+    rungs (not just the immediately previous one), so a later rung's compact inventory
+    (`_format_seen_schema`) and delta (`schema_delta`) are computed against the full accumulated
+    picture. Node/relationship-type properties are unioned by property name (`_merge_props`);
+    relationships are unioned as a `(start, type, end)` set, `a`'s order wins.
+    """
+    a_rel_keys = {(r.get("start"), r.get("type"), r.get("end")) for r in (a.get("relationships") or [])}
+    merged_relationships = list(a.get("relationships") or [])
+    for r in b.get("relationships") or []:
+        key = (r.get("start"), r.get("type"), r.get("end"))
+        if key not in a_rel_keys:
+            merged_relationships.append(r)
+            a_rel_keys.add(key)
+
+    return {
+        "node_props": _merge_props(a.get("node_props") or {}, b.get("node_props") or {}),
+        "relationships": merged_relationships,
+        "rel_props": _merge_props(a.get("rel_props") or {}, b.get("rel_props") or {}),
+        "metadata": a.get("metadata") or b.get("metadata") or {},
+    }
+
+
+_SEEN_SCHEMA_HEADER = "Schema already shown at an earlier, failed attempt:"
+_NEW_SCHEMA_HEADER = "Additional schema, not shown above:"
+
+
+def _format_seen_schema(seen_structured: Dict[str, Any]) -> str:
+    """A short reminder of everything a previous cascade rung already showed the model -- property
+    names/types via the terse (`is_enhanced=False`) `format_schema` style (no per-property
+    examples/statistics), regardless of the cascade's own `is_enhanced` setting. Used by
+    `resolve_cascade_mode_levels`'s `strategy=CascadeStrategy.DELTA` so a later rung's prompt --
+    still a fresh, self-contained generation, no conversation history -- lets the model correctly
+    reference a label/type it already saw, without repeating the enhanced-mode verbosity of a full
+    re-statement. Returns `""` if `seen_structured` is empty (nothing shown yet).
+    """
+    if not (
+        seen_structured.get("node_props") or seen_structured.get("relationships") or seen_structured.get("rel_props")
+    ):
+        return ""
+    return _SEEN_SCHEMA_HEADER + "\n" + format_schema(seen_structured, is_enhanced=False)
+
+
+def _format_delta_rung(new_structured: Dict[str, Any], seen_structured: Dict[str, Any], is_enhanced: bool) -> str:
+    """A `strategy=CascadeStrategy.DELTA` rung's prompt text after the first: a compact inventory
+    of everything shown so far (`_format_seen_schema`) plus only the elements `new_structured` adds
+    on top of it (`schema_delta`), formatted at the cascade's own `is_enhanced` level. Falls back to
+    just the delta text if nothing has been shown yet."""
+    delta_text = format_schema(schema_delta(new_structured, seen_structured), is_enhanced=is_enhanced)
+    seen_text = _format_seen_schema(seen_structured)
+    if not seen_text:
+        return delta_text
+    return seen_text + "\n\n" + _NEW_SCHEMA_HEADER + "\n" + delta_text
+
+
 def _relationship_neighbors(structured_schema: Dict[str, Any], labels: Iterable[str]) -> "set[str]":
     """Node labels connected to any of `labels` by a relationship, in either direction.
 
@@ -208,8 +288,8 @@ def expand_labels_by_hops(structured_schema: Dict[str, Any], start_labels: Itera
     """BFS out from `start_labels` over `structured_schema`'s relationships, `hops` hops deep.
 
     Returns every label reached within `hops` hops (`start_labels` included). Used by
-    `two_hop_expansion_prune` for `resolve_cascade_mode_levels`'s `strategy="delta"`
-    "expansion_2hop" rung.
+    `two_hop_expansion_prune` -- a standalone structural pruning utility, not currently one of
+    `resolve_cascade_mode_levels`'s cascade rungs.
     """
     reached = set(start_labels)
     frontier = set(start_labels)
@@ -224,7 +304,7 @@ def expand_labels_by_hops(structured_schema: Dict[str, Any], start_labels: Itera
 def two_hop_expansion_prune(
     structured_schema: Dict[str, Any], narrow_labels: Iterable[str], hops: int = 2
 ) -> Dict[str, Any]:
-    """The "expansion_2hop" rung for `cascade_strategy="delta"`.
+    """A purely structural pruning: `narrow_labels`'s neighborhood, `hops` hops out.
 
     `narrow_labels`'s structural neighborhood, `hops` hops out over the full schema treated as a
     graph of node labels connected by relationships (see `expand_labels_by_hops`) — every node
@@ -236,6 +316,47 @@ def two_hop_expansion_prune(
     """
     expanded_labels = expand_labels_by_hops(structured_schema, narrow_labels, hops)
     return _apply_selection(structured_schema, expanded_labels, [])
+
+
+def narrow_top2_relationships(
+    structured_schema: Dict[str, Any], question: str, top_k: int = 2
+) -> Dict[str, Any]:
+    """Restrict `structured_schema`'s relationships to the `top_k` patterns per `(start, end)`
+    endpoint pair, ranked by lexical token-overlap between each pattern's relationship type and
+    `question` (see `_lexical_overlap_score`) -- ties keep their original relative order. A pair
+    with `top_k` or fewer patterns keeps all of them, untouched.
+
+    This is the "top2" tightening `resolve_cascade_mode_levels` applies, for
+    `strategy=CascadeStrategy.DELTA`, on top of whichever node-label/relationship selection `mode`
+    already narrowed `structured_schema` to (`"true_narrow_top2"`, the first rung) -- when a
+    node-label pair is connected by several relationship types, this keeps only the ones most
+    likely relevant to the question, instead of all of them. Purely lexical and structural,
+    independent of `mode` and needing no `nlp`/`llm`/`ie_engine`, like `two_hop_expansion_prune`.
+    `node_props` is left untouched -- only `relationships`/`rel_props` are narrowed further, to
+    whichever relationship types survive the trim.
+    """
+    question_tokens = _normalize_tokens(question)
+    relationships = structured_schema.get("relationships") or []
+
+    groups: Dict[Tuple[Optional[str], Optional[str]], List[Dict[str, Any]]] = {}
+    for r in relationships:
+        groups.setdefault((r.get("start"), r.get("end")), []).append(r)
+
+    kept: List[Dict[str, Any]] = []
+    for group in groups.values():
+        ranked = sorted(
+            group, key=lambda r: _lexical_overlap_score(r.get("type", ""), question_tokens), reverse=True
+        )
+        kept.extend(ranked[:top_k])
+
+    kept_types = {r.get("type") for r in kept}
+    rel_props = structured_schema.get("rel_props", {}) or {}
+    return {
+        "node_props": structured_schema.get("node_props", {}) or {},
+        "relationships": kept,
+        "rel_props": {t: props for t, props in rel_props.items() if t in kept_types},
+        "metadata": structured_schema.get("metadata", {}),
+    }
 
 
 def exact_match_prune(
@@ -683,15 +804,13 @@ def resolve_cascade_mode_levels(
     aggressive pruning: `CascadeModeLevel.NARROW` (node labels,
     relationship types, and properties all narrowed to the question —
     `ALL_SCHEMA_COMPONENTS`; skipped entirely if `skip_narrow`),
-    `CascadeModeLevel.NODES_ONLY` — under `strategy=STANDARD`, only node
-    labels matched (`DEFAULT_SCHEMA_COMPONENTS`; relationships kept via
-    shared endpoints, every property of a selected label/type kept); under
-    `strategy=DELTA`, instead the "expansion_2hop" rung: `narrow`'s node
-    labels expanded 2 hops out over the full schema's relationships (see
-    `two_hop_expansion_prune`) — purely structural, independent of `mode` —
-    then always `CascadeModeLevel.FULL` last (the unpruned schema — built by
+    `CascadeModeLevel.NODES_ONLY` (only node labels matched —
+    `DEFAULT_SCHEMA_COMPONENTS`; relationships kept via shared endpoints,
+    every property of a selected label/type kept), then always
+    `CascadeModeLevel.FULL` last (the unpruned schema — built by
     re-formatting the same `structured` schema already fetched above for the
-    other rungs, not a second Neo4j round-trip).
+    other rungs, not a second Neo4j round-trip). The *selection* each rung
+    prunes down to is the same regardless of `strategy`.
 
     `mode` must be a pruning schema_mode — `"exact_match"`,
     `"ner_exact_match"`, `"similarity"`, `"llm_pruning"`, or
@@ -703,14 +822,35 @@ def resolve_cascade_mode_levels(
     docstring.
 
     `strategy` (default `CascadeStrategy.STANDARD`) controls what each rung's
-    `schema_text` actually contains: `STANDARD` formats each rung's full
-    structured schema, independently of the others (today's behavior).
-    `DELTA` (the "Incremental delta cascade") instead formats only the
-    *first* rung in full — every rung after that gets `schema_delta(this
-    rung's structured schema, the previous rung's)`, i.e. only the elements
-    not already shown at a previous rung — and additionally swaps the second
-    rung's *selection* itself from `nodes_only` pruning to the 2-hop
-    structural expansion described above.
+    `schema_text` actually contains. `STANDARD` formats each rung's full
+    structured schema, independently of the others (no memory of previous
+    rungs, nothing held back).
+
+    `DELTA` (the "Incremental delta cascade") instead:
+
+    1. Additionally tightens `"narrow"` with `narrow_top2_relationships` —
+       when several relationship types connect the same node-label pair,
+       only the `top_k=2` most lexically relevant to the question survive
+       (`"true_narrow_top2"`) — so the first, cheapest rung is genuinely
+       narrow instead of keeping every relationship between selected labels.
+    2. Shows every rung after the first not as its full structured schema,
+       but as a compact inventory of everything shown at a previous rung
+       (`_format_seen_schema` — property names/types, no examples/stats) plus
+       only the elements newly introduced at this rung on top of that
+       (`schema_delta`) — see `_format_delta_rung`. This keeps a rung's
+       self-contained prompt (see below) from either repeating the full
+       schema already sent in a failed earlier rung (expensive) or showing
+       *only* the delta with no memory of what the model already knows
+       (useless — the model would have no idea labels/types mentioned only
+       in an earlier rung even exist). The "seen so far" tracked across rungs
+       accumulates via `_merge_structured`, not just the immediately previous
+       rung's selection, so a rung 3 correctly excludes what either rung 1 or
+       rung 2 already showed.
+
+    Every rung, under both strategies, is still a fresh, independent,
+    self-contained prompt — no reference to a previous rung's generated
+    query or why it needed to move on (deliberately unlike `rescue_prompt`'s
+    fix-up mechanic); only the schema payload changes per rung.
     """
     mode = SchemaMode(mode)
     strategy = CascadeStrategy(strategy)
@@ -732,10 +872,7 @@ def resolve_cascade_mode_levels(
 
     structured_levels: List[Tuple[CascadeModeLevel, Dict[str, Any]]] = []
 
-    # DELTA needs narrow's label set to seed the 2-hop expansion even when skip_narrow=True
-    # skips *emitting* narrow as its own rung.
-    narrow: Optional[Dict[str, Any]] = None
-    if not skip_narrow or strategy == CascadeStrategy.DELTA:
+    if not skip_narrow:
         if mode == SchemaMode.EXACT_MATCH:
             narrow = exact_match_prune(structured, question, components=ALL_SCHEMA_COMPONENTS)
         elif mode == SchemaMode.NER_EXACT_MATCH:
@@ -746,12 +883,11 @@ def resolve_cascade_mode_levels(
             narrow = llm_prune(structured, question, llm)
         else:  # IE_EXTRACTION
             narrow = ie_prune(structured, question, ie_engine, components=ALL_SCHEMA_COMPONENTS)
-    if not skip_narrow:
+        if strategy == CascadeStrategy.DELTA:
+            narrow = narrow_top2_relationships(narrow, question)
         structured_levels.append((CascadeModeLevel.NARROW, narrow))
 
-    if strategy == CascadeStrategy.DELTA:
-        nodes_only = two_hop_expansion_prune(structured, (narrow or {}).get("node_props", {}).keys())
-    elif mode == SchemaMode.EXACT_MATCH:
+    if mode == SchemaMode.EXACT_MATCH:
         nodes_only = exact_match_prune(structured, question, components=DEFAULT_SCHEMA_COMPONENTS)
     elif mode == SchemaMode.NER_EXACT_MATCH:
         nodes_only = ner_exact_match_prune(structured, question, nlp, components=DEFAULT_SCHEMA_COMPONENTS)
@@ -766,13 +902,17 @@ def resolve_cascade_mode_levels(
     structured_levels.append((CascadeModeLevel.FULL, structured))
 
     levels: List[Tuple[CascadeModeLevel, str]] = []
-    previous_structured: Optional[Dict[str, Any]] = None
-    for level, level_structured in structured_levels:
-        if strategy == CascadeStrategy.DELTA and previous_structured is not None:
-            text = format_schema(schema_delta(level_structured, previous_structured), is_enhanced=is_enhanced)
-        else:
-            text = format_schema(level_structured, is_enhanced=is_enhanced)
-        levels.append((level, text))
-        previous_structured = level_structured
+    if strategy == CascadeStrategy.DELTA:
+        seen: Optional[Dict[str, Any]] = None
+        for level, level_structured in structured_levels:
+            if seen is None:
+                text = format_schema(level_structured, is_enhanced=is_enhanced)
+            else:
+                text = _format_delta_rung(level_structured, seen, is_enhanced)
+            levels.append((level, text))
+            seen = level_structured if seen is None else _merge_structured(seen, level_structured)
+    else:
+        for level, level_structured in structured_levels:
+            levels.append((level, format_schema(level_structured, is_enhanced=is_enhanced)))
 
     return levels

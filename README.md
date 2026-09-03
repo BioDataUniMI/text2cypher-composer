@@ -354,24 +354,29 @@ Only meaningful for a pruning `schema_mode` (`"exact_match"`, `"ner_exact_match"
 The cascade above repeats itself: `"narrow"`'s node labels/relationship types show up again,
 folded into `"nodes_only"`'s bigger blob, which shows up again inside `"full"`'s — so a schema
 element already sent to the model in an earlier, failed rung gets paid for again in every later
-rung's prompt. `cascade_strategy="delta"` (default `"standard"`) avoids that redundancy — and
-changes what the second rung actually is:
+rung's prompt. `cascade_strategy="delta"` (default `"standard"`) avoids that redundancy without
+falling into the opposite trap of showing a later rung *only* the new elements and nothing else —
+each rung is still a fresh, self-contained prompt with no conversation history, so a bare delta
+would leave the model unable to reference a label/type it saw only at an earlier rung. Two changes
+on top of `"standard"`:
 
-1. **`"narrow"`** — unchanged, same as `"standard"`.
-2. **`"expansion_2hop"`** (replaces `"nodes_only"`'s pruning here) — a purely structural
-   expansion: take `"narrow"`'s node labels, treat the full schema as a graph where every
-   `(:A)-[:R]->(:B)` pattern is an edge between `A` and `B`, and expand outward 2 hops, collecting
-   every node label and relationship reached (see `two_hop_expansion_prune`). Independent of
-   `schema_mode` — it needs no `question`/`nlp`/`llm`/`ie_engine`, only the graph's own structure.
-3. **`"full"`** — unchanged.
+1. **`"narrow"`** — additionally tightened to `"true_narrow_top2"`: when a node-label pair is
+   connected by more than 2 relationship types, only the 2 most lexically similar to the question
+   survive (`narrow_top2_relationships`) — purely token-overlap based, no `nlp`/`llm` needed.
+   Makes the cheapest, first rung genuinely narrow instead of keeping every relationship between
+   the selected labels.
+2. **`"nodes_only"`/`"full"`** — same selection as `"standard"`, but each one's prompt now carries
+   a **compact inventory** of everything a previous rung already showed (label/type/property
+   names only, via the terse non-enhanced `format_schema` style — no examples/statistics) plus
+   only the schema elements *newly introduced* at this rung (`schema_delta`) shown in full. The
+   "already shown" side accumulates across *all* previous rungs, not just the immediately
+   preceding one, so the `"full"` rung's inventory covers both `"narrow"` and `"nodes_only"`.
 
 Every rung, at every step of the cascade, is still a **fresh, independent, self-contained
 prompt** — exactly like `cascade_strategy="standard"`, and deliberately *not* like
 `rescue_prompt`'s fix-up mechanic: a rung carries no reference to a previous rung's generated
 query or why it failed, so the effect of progressively revealing more schema can be studied in
-isolation from `rescue_prompt`'s error-aware correction. The only thing that changes per rung is
-the `enhanced_schema` payload itself: each rung after the first shows only the schema elements
-*newly introduced* at that rung (`schema_delta`), not the ones a previous rung already showed:
+isolation from `rescue_prompt`'s error-aware correction.
 
 ```python
 result = run(
@@ -384,8 +389,8 @@ result = run(
     cascade_strategy="delta",
 )
 
-print(result.cascade_mode_level)   # "narrow" / "nodes_only" (= expansion_2hop here) / "full"
-print(result.schema)               # the DELTA text shown at that rung, not the cumulative schema
+print(result.cascade_mode_level)   # "narrow" (= true_narrow_top2) / "nodes_only" / "full"
+print(result.schema)               # that rung's text: inventory + delta, not the cumulative schema
 print(result.prompt)               # a fresh, self-contained prompt -- no previous-rung reference
 ```
 

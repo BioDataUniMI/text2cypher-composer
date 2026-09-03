@@ -155,15 +155,22 @@ class CascadeStrategy(str, Enum):
     - "standard" (default): each rung's prompt carries that rung's *full*
       schema (narrow, then nodes_only, then full) as a fresh, self-contained
       generation — no reference to a previous rung's attempt.
-    - "delta": the "Incremental delta cascade". Only the first rung
-      ("narrow") gets a full, self-contained prompt. Every rung after that
-      is instead a rescue-style continuation (see `rescue.rescue_messages`/
-      `rescue.build_error_message`) built from the *previous* rung's
-      generated query and why it needed to move on, showing only the schema
-      elements newly introduced at this rung (`schema_modes.schema_delta`) —
-      not the ones already shown at a previous rung. This cuts redundant
-      schema tokens repeated across rungs, at the cost of each rung after
-      the first depending on the previous rung's output.
+    - "delta": the "Incremental delta cascade". `"narrow"` is additionally
+      tightened to only the top-2 relationship patterns (by lexical
+      similarity to the question) per node-label pair
+      (`schema_modes.narrow_top2_relationships` — "true_narrow_top2") and
+      still gets a full, self-contained prompt, same as "standard". Every
+      rung after that is *also* a fresh, self-contained prompt — still no
+      reference to a previous rung's generated query or why it needed to
+      move on, exactly like "standard" — but its schema payload is instead a
+      compact inventory of everything a previous rung already showed (label/
+      type/property names, no examples — `schema_modes._format_seen_schema`)
+      plus only the schema elements newly introduced at this rung
+      (`schema_modes.schema_delta`). This avoids both extremes: repeating
+      the full schema already sent in a failed earlier rung (expensive), and
+      showing *only* the new elements with no memory of what the model
+      already saw (useless, since each rung is a fresh call with no
+      conversation history).
     """
 
     STANDARD = "standard"

@@ -943,16 +943,24 @@ md("""\
 The cascade above repeats itself: `"narrow"`'s node labels/relationship types show up again,
 folded into `"nodes_only"`'s bigger blob — so a schema element already sent to the model in an
 earlier, failed rung gets paid for again in the next rung's prompt. `cascade_strategy="delta"`
-(default `"standard"`) avoids that, and changes what the second rung is: instead of `"nodes_only"`
-pruning, it becomes `"expansion_2hop"` — a purely structural expansion of `"narrow"`'s node labels,
-2 hops out over the full schema treated as a graph (every `(:A)-[:R]->(:B)` pattern an edge between
-`A` and `B`), independent of `schema_mode`.
+(default `"standard"`) avoids that redundancy, but without the opposite failure mode either: since
+every rung is still a fresh, self-contained prompt with no conversation history, showing a later
+rung *only* the newly introduced elements would leave the model unable to reference a label/type
+it only saw at an earlier rung. Two changes on top of `"standard"`:
+
+1. **`"narrow"`** becomes `"true_narrow_top2"` — when a node-label pair is connected by more than
+   2 relationship types, only the 2 most lexically similar to the question survive
+   (`narrow_top2_relationships`, pure token overlap, no `nlp`/`llm` needed) — so the cheapest,
+   first rung is genuinely narrow.
+2. **`"nodes_only"`/`"full"`** keep the same selection as `"standard"`, but their prompt now shows
+   a **compact inventory** of everything a previous rung already showed (label/type/property names
+   only, no examples — the terse non-enhanced `format_schema` style) plus only what's *newly
+   introduced* at this rung, in full. The inventory accumulates across every previous rung, not
+   just the one immediately before it.
 
 Every rung stays a **fresh, independent, self-contained prompt** — no reference to a previous
 rung's query or failure, deliberately unlike `rescue_prompt`'s fix-up mechanic, so the effect of
-progressively revealing more schema can be studied on its own. Only the schema payload changes per
-rung: each one after the first shows only what's newly introduced, not what a previous rung
-already showed.
+progressively revealing more schema can be studied on its own.
 
 We reuse the exact same flaky-then-fixed scenario as `result_cascade` above, so the two
 strategies' prompt token counts are directly comparable:
@@ -989,8 +997,8 @@ print("  delta cascade:   ", result_delta_cascade.cascade_mode_prompt_tokens)
 
 md("""\
 The winning (second) rung's prompt is still a fresh, self-contained "Schema" prompt — no
-reference to the first rung's broken query, no error message — carrying only the schema newly
-introduced at `"expansion_2hop"`, not `"narrow"`'s again:
+reference to the first rung's broken query, no error message — carrying a compact inventory of
+what `"true_narrow_top2"` already showed plus only the schema newly introduced at `"nodes_only"`:
 """)
 
 code("""\
@@ -1494,13 +1502,15 @@ md("""\
   `result.cascade_mode_level`/`result.cascade_mode_attempts`/`result.cascade_mode_prompts`/
   `result.cascade_mode_prompt_tokens` report which rung was used and what each tried rung cost.
 - `cascade_strategy="delta"` (§9.1, requires `cascade_mode=True`) is the "Incremental delta
-  cascade": the second rung becomes `"expansion_2hop"` — a purely structural 2-hop expansion of
-  `"narrow"`'s node labels over the full schema graph — instead of `"nodes_only"` pruning. Every
-  rung, including this one, stays a fresh, independent, self-contained prompt (no reference to a
-  previous rung's query or failure, unlike `rescue_prompt`) and shows only the schema newly
-  introduced at that rung, not what a previous rung already showed — cutting redundant schema
-  tokens across rungs while keeping the schema-expansion effect isolated from any correction
-  mechanic. `result.schema` then holds that rung's delta text, not the cumulative schema.
+  cascade": `"narrow"` becomes `"true_narrow_top2"` (only the 2 most lexically relevant
+  relationship types per node-label pair survive), and every rung after the first shows a compact
+  inventory of everything a previous rung already showed (label/type/property names, no examples)
+  plus only the schema newly introduced at that rung — instead of repeating the full schema, or
+  showing only the delta with no memory of what the model already saw. Every rung, including this
+  one, stays a fresh, independent, self-contained prompt (no reference to a previous rung's query
+  or failure, unlike `rescue_prompt`), keeping the schema-tightening effect isolated from any
+  correction mechanic. `result.schema` then holds that rung's inventory + delta text, not the
+  cumulative schema.
 - `self_verification=True` (§10, requires `rescue_prompt` or `cascade_mode`) adds a post-execution
   semantic check on top of either retry strategy's mechanical one: once an attempt looks
   mechanically fine, a model reviews `(question, cypher, result)` and judges whether it actually
