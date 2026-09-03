@@ -1402,10 +1402,10 @@ print(list(all_templates.keys()))
 md("""\
 ## 14. Bulk evaluation against a gold test set
 
-`evaluate_technique` runs a technique over a whole gold `(question, query)` set and reports
+`evaluate_technique` runs a technique over a whole gold `(question, cypher)` set and reports
 Jaro-Winkler, normalized Levenshtein, Jaccard, Coverage, and pass@k. We reuse the mock
-`mock_df` from §5.1 as the gold set — `evaluate_technique` expects a `"query"` column, so we
-rename `mock_df`'s `"cypher"` column back to it.
+`mock_df` from §5.1 as the gold set directly — `evaluate_technique` expects "question"/"cypher"
+columns, the same names `mock_df`/`load_finetune_levels`/`build_rag_example_files` already use.
 
 Jaccard/Coverage compare the two queries' **result rows**, not their Cypher text (a
 differently-worded but equivalent query should still score well): rows are greedily matched by
@@ -1424,7 +1424,7 @@ is pulling its weight — and costing in tokens — across a whole gold set, not
 code("""\
 from text2cypher_composer import evaluate_technique
 
-gold_df = mock_df.rename(columns={"cypher": "query"})
+gold_df = mock_df
 
 report = evaluate_technique(
     gold_df,
@@ -1598,7 +1598,12 @@ md("""\
   `rescued`/`rescue_attempts`/`rescue_error_messages`/`rescue_prompts`/`rescue_prompt_tokens`,
   `self_verification_passed`/`self_verification_reasoning`, and `cascade_mode_level`/
   `cascade_mode_attempts`/`cascade_mode_prompts`/`cascade_mode_prompt_tokens` (`adaptive_rag_*`
-  siblings when `adaptive_rag=True` is used instead) per question.
+  siblings when `adaptive_rag=True` is used instead) per question. The gold `df` needs
+  "question"/"cypher" columns (not "query" -- the same names `load_finetune_levels`/
+  `build_rag_example_files` already use); `save_evaluation_report()`'s `.xlsx` maps every
+  boolean column to `1`/`0`/blank instead of Python `True`/`False`, which spreadsheet software
+  otherwise renders in its own display locale (e.g. `VERO`/`FALSO` in Italian Excel) -- the `.pkl`
+  keeps real `bool`s.
 """)
 
 nb["cells"] = cells

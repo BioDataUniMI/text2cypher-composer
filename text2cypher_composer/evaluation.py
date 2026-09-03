@@ -34,7 +34,7 @@ class QuestionEvaluation:
     first attempt only. `passes[i]` is whether attempt `i` alone achieved
     `coverage == 1.0`; `pass_at(j)` folds `passes[:j]` into "at least one of
     the first j attempts passed". `extra` is any `df` columns other than
-    "question"/"query" (e.g. bio2C's "ID"/"level"), carried through unchanged
+    "question"/"cypher" (e.g. bio2C's "ID"/"level"), carried through unchanged
     for traceability in `to_dataframe()`. `rescued`/`rescue_attempts`/
     `rescue_error_messages`/`rescue_prompts`/`rescue_prompt_tokens`/
     `execution_error`/`execution_warnings`/`prompt_tokens` proxy the first
@@ -267,13 +267,13 @@ def evaluate_technique(
     cascade_strategy: CascadeStrategyLike = CascadeStrategy.STANDARD,
     adaptive_rag: bool = False,
 ) -> EvaluationReport:
-    """Evaluate `technique` in bulk over a gold (question, query) test set.
+    """Evaluate `technique` in bulk over a gold (question, cypher) test set.
 
     For each row, generates `k` independent Cypher completions for the
     question (via `run()`, so every attempt goes through the full
     schema/RAG/execution/CyVer pipeline for `technique`) and scores them
     against the gold query's actual result rows (obtained by executing
-    `row["query"]` against `database`):
+    `row["cypher"]` against `database`):
 
     - `jaro_winkler` / `levenshtein`: text similarity between the gold and
       generated Cypher (computed on the first attempt only).
@@ -284,7 +284,9 @@ def evaluate_technique(
       `j` attempts achieved `coverage == 1.0`.
 
     Args:
-        df: DataFrame with "question" and "query" columns (the gold set).
+        df: DataFrame with "question" and "cypher" columns (the gold set) —
+            same column names `load_finetune_levels`/`build_rag_example_files`
+            already use.
         model, database, technique, dataset: forwarded to `run()` for every
             attempt — see `run()` for their meaning and constraints (e.g.
             `dataset` required iff `technique` uses RAG).
@@ -352,18 +354,18 @@ def evaluate_technique(
         `pass_at_k`), and per-question `details` (`.to_dataframe()` for a
         flat table).
     """
-    if "question" not in df.columns or "query" not in df.columns:
-        raise ValueError("`df` must have 'question' and 'query' columns.")
+    if "question" not in df.columns or "cypher" not in df.columns:
+        raise ValueError("`df` must have 'question' and 'cypher' columns.")
     if k < 1:
         raise ValueError("`k` must be >= 1.")
 
     graph = resolve_database(database)
-    extra_cols = [c for c in df.columns if c not in ("question", "query")]
+    extra_cols = [c for c in df.columns if c not in ("question", "cypher")]
 
     details: List[QuestionEvaluation] = []
     for _, row in df.iterrows():
         question = str(row["question"])
-        gold_cypher = normalize_generated_cypher(str(row["query"]))
+        gold_cypher = normalize_generated_cypher(str(row["cypher"]))
 
         try:
             gold_data = execute_cypher(graph, gold_cypher)
@@ -440,6 +442,17 @@ def evaluate_technique(
 _UNSAFE_FILENAME_CHARS = re.compile(r"[\\/:]")
 
 
+def _is_boolean_column(series: pd.Series) -> bool:
+    """Whether `series` only ever holds `bool` (`None`/`NaN` allowed) -- e.g. `to_dataframe()`'s
+    `executed`, `pass@j`, `rescued`, and `self_verification_passed` columns. Used by
+    `save_evaluation_report` to map such a column to `1`/`0` for the `.xlsx` export instead of
+    leaving it as Python `True`/`False` (see its docstring for why)."""
+    if series.dtype == bool:
+        return True
+    non_null = series.dropna()
+    return len(non_null) > 0 and non_null.map(lambda v: isinstance(v, bool)).all()
+
+
 def save_evaluation_report(report: EvaluationReport, output_dir: Union[str, Path]) -> Dict[str, Path]:
     """Persist `report` to disk as a `.pkl` and an `.xlsx`, one pair per (model, technique).
 
@@ -450,12 +463,17 @@ def save_evaluation_report(report: EvaluationReport, output_dir: Union[str, Path
     unsafe in a filename (`/`, `\\`, `:` — e.g. a HuggingFace model id or a
     `"ft:..."` id) are replaced with `_`.
 
-    The `.pkl` holds `report.to_dataframe()` as-is (lists/dicts intact —
-    `prompt`, `gold_data`, `predicted_data`, `retrieved_example_*`, no extra
-    dependency needed). The `.xlsx` is the same table with any list/dict
-    column stringified (Excel has no native list/dict type), and needs the
-    optional `excel` dependency (`openpyxl`) — install with
-    `pip install "text2cypher-composer[excel]"`.
+    The `.pkl` holds `report.to_dataframe()` as-is (lists/dicts and real
+    `bool`s intact — `prompt`, `gold_data`, `predicted_data`,
+    `retrieved_example_*`, no extra dependency needed). The `.xlsx` is the
+    same table with two changes Excel needs: any list/dict column stringified
+    (Excel has no native list/dict type), and any boolean column (`executed`,
+    `pass@1`..`pass@k`, `rescued`, `self_verification_passed`) mapped to
+    `1`/`0`/blank instead of Python `True`/`False` — spreadsheet software
+    otherwise renders those in the *display* locale (e.g. `VERO`/`FALSO` in
+    Italian Excel), which reads as a different, unfilterable value from what
+    `to_dataframe()` actually returned. Needs the optional `excel` dependency
+    (`openpyxl`) — install with `pip install "text2cypher-composer[excel]"`.
 
     Returns `{"pkl": <path>, "xlsx": <path>}`.
     """
@@ -481,7 +499,9 @@ def save_evaluation_report(report: EvaluationReport, output_dir: Union[str, Path
 
     excel_df = df.copy()
     for col in excel_df.columns:
-        if excel_df[col].map(lambda v: isinstance(v, (list, dict))).any():
+        if _is_boolean_column(excel_df[col]):
+            excel_df[col] = excel_df[col].map(lambda v: int(v) if isinstance(v, bool) else v)
+        elif excel_df[col].map(lambda v: isinstance(v, (list, dict))).any():
             excel_df[col] = excel_df[col].map(str)
     excel_df.to_excel(xlsx_path, index=False)
 

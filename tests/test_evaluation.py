@@ -275,7 +275,7 @@ def test_to_dataframe_retrieved_examples_none_for_non_rag():
 
 
 def test_evaluate_technique_forwards_rescue_prompt_and_max_retries_to_run():
-    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+    df = pd.DataFrame([{"question": "How many genes?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"}])
 
     with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
          patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
@@ -295,7 +295,7 @@ def test_evaluate_technique_forwards_rescue_prompt_and_max_retries_to_run():
 
 
 def test_evaluate_technique_defaults_rescue_prompt_to_false():
-    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+    df = pd.DataFrame([{"question": "How many genes?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"}])
 
     with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
          patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
@@ -307,7 +307,7 @@ def test_evaluate_technique_defaults_rescue_prompt_to_false():
 
 
 def test_evaluate_technique_forwards_self_verification_params_to_run():
-    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+    df = pd.DataFrame([{"question": "How many genes?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"}])
 
     with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
          patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
@@ -329,7 +329,7 @@ def test_evaluate_technique_forwards_self_verification_params_to_run():
 
 
 def test_evaluate_technique_defaults_self_verification_to_false():
-    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+    df = pd.DataFrame([{"question": "How many genes?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"}])
 
     with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
          patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
@@ -342,7 +342,7 @@ def test_evaluate_technique_defaults_self_verification_to_false():
 
 
 def test_evaluate_technique_forwards_schema_params_to_run():
-    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+    df = pd.DataFrame([{"question": "How many genes?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"}])
     fake_nlp = object()
     fake_ie_engine = object()
 
@@ -369,7 +369,7 @@ def test_evaluate_technique_forwards_schema_params_to_run():
 
 
 def test_evaluate_technique_defaults_schema_params():
-    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+    df = pd.DataFrame([{"question": "How many genes?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"}])
 
     with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
          patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
@@ -383,7 +383,7 @@ def test_evaluate_technique_defaults_schema_params():
 
 
 def test_evaluate_technique_forwards_cascade_mode_params_to_run():
-    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+    df = pd.DataFrame([{"question": "How many genes?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"}])
 
     with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
          patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
@@ -405,7 +405,7 @@ def test_evaluate_technique_forwards_cascade_mode_params_to_run():
 
 
 def test_evaluate_technique_forwards_adaptive_rag_to_run():
-    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+    df = pd.DataFrame([{"question": "How many genes?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"}])
 
     with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
          patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
@@ -416,7 +416,7 @@ def test_evaluate_technique_forwards_adaptive_rag_to_run():
 
 
 def test_evaluate_technique_defaults_cascade_and_adaptive_rag_to_false():
-    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+    df = pd.DataFrame([{"question": "How many genes?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"}])
 
     with patch("text2cypher_composer.evaluation.resolve_database", return_value=MagicMock()), \
          patch("text2cypher_composer.evaluation.execute_cypher", return_value=[{"c": 42}]), \
@@ -455,3 +455,46 @@ def test_save_evaluation_report_sanitizes_unsafe_model_chars(tmp_path):
 
     assert ":" not in paths["pkl"].name
     assert ":" not in paths["xlsx"].name
+
+
+def test_save_evaluation_report_xlsx_maps_booleans_to_1_0(tmp_path):
+    """Excel renders Python bool in the *display* locale (e.g. VERO/FALSO in Italian Excel) --
+    the .xlsx export should carry 1/0 instead, so the value reads the same everywhere. The .pkl
+    keeps real bools (readable back into pandas/Python as-is)."""
+    pytest.importorskip("openpyxl")
+    rescued_result = _fake_result(rescued=True, self_verification_passed=False)
+    details = [_fake_question_evaluation(attempts=[rescued_result])]
+    report = EvaluationReport(
+        summary=EvaluationSummary(
+            technique="Schema+RAG",
+            model="gpt-4o-mini",
+            n_questions=1,
+            k=1,
+            mean_jaro_winkler=1.0,
+            mean_levenshtein=1.0,
+            mean_jaccard=1.0,
+            mean_coverage=1.0,
+            pass_at_k={1: 1.0},
+        ),
+        details=details,
+    )
+
+    paths = save_evaluation_report(report, tmp_path)
+
+    pkl_df = pd.read_pickle(paths["pkl"])
+    assert bool(pkl_df.iloc[0]["executed"]) is True
+    assert bool(pkl_df.iloc[0]["rescued"]) is True
+    assert bool(pkl_df.iloc[0]["pass@1"]) is True
+
+    xlsx_df = pd.read_excel(paths["xlsx"])
+    assert xlsx_df.iloc[0]["executed"] == 1
+    assert xlsx_df.iloc[0]["rescued"] == 1
+    assert xlsx_df.iloc[0]["pass@1"] == 1
+    assert xlsx_df.iloc[0]["self_verification_passed"] == 0
+
+
+def test_evaluate_technique_requires_cypher_column():
+    df = pd.DataFrame([{"question": "How many genes?", "query": "MATCH (g:Gene) RETURN count(g) AS c"}])
+
+    with pytest.raises(ValueError, match="cypher"):
+        evaluate_technique(df, model="gpt-4o-mini", database={}, technique="vanilla")

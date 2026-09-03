@@ -935,8 +935,8 @@ import pandas as pd
 from text2cypher_composer import evaluate_technique
 
 gold_df = pd.DataFrame([
-    {"question": "How many genes are there?", "query": "MATCH (g:Gene) RETURN count(g) AS c"},
-    {"question": "List all cancers.", "query": "MATCH (c:Cancer) RETURN c.Label AS Cancer"},
+    {"question": "How many genes are there?", "cypher": "MATCH (g:Gene) RETURN count(g) AS c"},
+    {"question": "List all cancers.", "cypher": "MATCH (c:Cancer) RETURN c.Label AS Cancer"},
 ])
 
 report = evaluate_technique(
@@ -977,7 +977,7 @@ report.to_dataframe()["cascade_mode_level"]  # which rung ("narrow"/"nodes_only"
 For each question, `k` independent Cypher completions are generated (via
 `run()`, so every attempt goes through the full technique pipeline —
 schema/RAG retrieval, execution, CyVer validation) and compared against the
-gold query's actual result rows (obtained by executing `row["query"]`
+gold query's actual result rows (obtained by executing `row["cypher"]`
 against `database`). `jaro_winkler`/`levenshtein`/`jaccard`/`coverage` are
 computed on the first attempt; `pass@j` (for every `j` in `1..k`) is whether
 at least one of the first `j` attempts exactly reproduced the gold result
@@ -1008,7 +1008,7 @@ argument `run()` takes — same names, same defaults:
   `rescue_prompt`, same as `run()` enforces.
 
 Besides the metric/pass@j columns, `report.to_dataframe()` also carries, per question: any
-columns `gold_df` had beyond `question`/`query` (e.g. bio2C's `"ID"`/`"level"`, if you built
+columns `gold_df` had beyond `question`/`cypher` (e.g. bio2C's `"ID"`/`"level"`, if you built
 `gold_df` with `load_finetune_levels`), `prompt`/`prompt_tokens` (the exact messages sent for the
 first attempt and their `tiktoken` token count — `None` if `tiktoken` isn't installed; compare it
 across `technique`/`schema_mode` rows to see how many tokens schema filtering saves),
@@ -1040,9 +1040,13 @@ paths = save_evaluation_report(report, "evaluating_cypher_jaccard RTT/gpt-4o-min
 ```
 
 The `.pkl` holds `report.to_dataframe()` as-is — `prompt`/`gold_data`/`predicted_data`/
-`retrieved_example_*` stay native Python lists/dicts, no extra dependency needed. The `.xlsx` is
-the same table with those columns stringified (Excel has no list/dict type) and needs the
-optional `excel` dependency:
+`retrieved_example_*` stay native Python lists/dicts, and `executed`/`pass@1`..`pass@k`/`rescued`/
+`self_verification_passed` stay real Python `bool`s, no extra dependency needed. The `.xlsx` is
+the same table with those list/dict columns stringified (Excel has no list/dict type) and every
+boolean column mapped to `1`/`0`/blank instead — spreadsheet software otherwise renders Python
+`bool` in its own *display* locale (e.g. `VERO`/`FALSO` in Italian Excel, not filterable/sortable
+as the `TRUE`/`FALSE` the cell's actual value implies) — and needs the optional `excel`
+dependency:
 
 ```bash
 pip install "text2cypher-composer[excel]"
