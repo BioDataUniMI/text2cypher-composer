@@ -155,12 +155,16 @@ class CascadeStrategy(str, Enum):
     - "standard" (default): each rung's prompt carries that rung's *full*
       schema (narrow, then nodes_only, then full) as a fresh, self-contained
       generation — no reference to a previous rung's attempt.
-    - "delta": the "Incremental delta cascade". `"narrow"` is additionally
-      tightened to only the top-2 relationship patterns (by lexical
-      similarity to the question) per node-label pair
-      (`schema_modes.narrow_top2_relationships` — "true_narrow_top2") and
-      still gets a full, self-contained prompt, same as "standard". Every
-      rung after that is *also* a fresh, self-contained prompt — still no
+    - "delta": the "Incremental delta cascade". `"narrow"` is replaced by
+      `"true_narrow_top2"`: instead of the mode's own narrow pruning (which
+      can itself already be too wide), it's built from `"nodes_only"`'s own
+      node-label selection, keeping only the top-2 relationship patterns (by
+      lexical similarity to the question) per node-label pair
+      (`schema_modes.narrow_top2_relationships`) — so it's a strict,
+      cheap-to-fall-back-from subset of `"nodes_only"` (same labels/
+      properties, fewer relationship choices). Still gets a full,
+      self-contained prompt, same as "standard". Every rung after that is
+      *also* a fresh, self-contained prompt — still no
       reference to a previous rung's generated query or why it needed to
       move on, exactly like "standard" — but its schema payload is instead a
       compact inventory of everything a previous rung already showed (label/

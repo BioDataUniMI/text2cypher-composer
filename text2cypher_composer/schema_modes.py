@@ -327,13 +327,14 @@ def narrow_top2_relationships(
     with `top_k` or fewer patterns keeps all of them, untouched.
 
     This is the "top2" tightening `resolve_cascade_mode_levels` applies, for
-    `strategy=CascadeStrategy.DELTA`, on top of whichever node-label/relationship selection `mode`
-    already narrowed `structured_schema` to (`"true_narrow_top2"`, the first rung) -- when a
-    node-label pair is connected by several relationship types, this keeps only the ones most
-    likely relevant to the question, instead of all of them. Purely lexical and structural,
-    independent of `mode` and needing no `nlp`/`llm`/`ie_engine`, like `two_hop_expansion_prune`.
-    `node_props` is left untouched -- only `relationships`/`rel_props` are narrowed further, to
-    whichever relationship types survive the trim.
+    `strategy=CascadeStrategy.DELTA`, on top of the `"nodes_only"` rung's own selection (not the
+    mode's `ALL_SCHEMA_COMPONENTS` narrow, which can itself already be too wide) to build
+    `"true_narrow_top2"`, the first rung -- when a node-label pair is connected by several
+    relationship types, this keeps only the ones most likely relevant to the question, instead of
+    all of them. Purely lexical and structural, independent of `mode` and needing no
+    `nlp`/`llm`/`ie_engine`, like `two_hop_expansion_prune`. `node_props` is left untouched --
+    only `relationships`/`rel_props` are narrowed further, to whichever relationship types survive
+    the trim.
     """
     question_tokens = _normalize_tokens(question)
     relationships = structured_schema.get("relationships") or []
@@ -828,11 +829,18 @@ def resolve_cascade_mode_levels(
 
     `DELTA` (the "Incremental delta cascade") instead:
 
-    1. Additionally tightens `"narrow"` with `narrow_top2_relationships` —
-       when several relationship types connect the same node-label pair,
-       only the `top_k=2` most lexically relevant to the question survive
-       (`"true_narrow_top2"`) — so the first, cheapest rung is genuinely
-       narrow instead of keeping every relationship between selected labels.
+    1. Replaces `"narrow"` with `"true_narrow_top2"`: instead of the mode's
+       `ALL_SCHEMA_COMPONENTS` narrow (which can itself already be too wide
+       — e.g. every relationship between two mentioned labels), it's built
+       from `"nodes_only"`'s own selection (same node labels, every
+       property, every inter-label relationship) with
+       `narrow_top2_relationships` applied on top: when several
+       relationship types connect the same node-label pair, only the
+       `top_k=2` most lexically relevant to the question survive. This
+       makes rung 1 a strict, cheap-to-fall-back-from subset of rung 2
+       (same labels/properties, fewer relationship choices) instead of a
+       differently-selected schema that might already be as wide as
+       `"nodes_only"`.
     2. Shows every rung after the first not as its full structured schema,
        but as a compact inventory of everything shown at a previous rung
        (`_format_seen_schema` — property names/types, no examples/stats) plus
@@ -872,21 +880,9 @@ def resolve_cascade_mode_levels(
 
     structured_levels: List[Tuple[CascadeModeLevel, Dict[str, Any]]] = []
 
-    if not skip_narrow:
-        if mode == SchemaMode.EXACT_MATCH:
-            narrow = exact_match_prune(structured, question, components=ALL_SCHEMA_COMPONENTS)
-        elif mode == SchemaMode.NER_EXACT_MATCH:
-            narrow = ner_exact_match_prune(structured, question, nlp, components=ALL_SCHEMA_COMPONENTS)
-        elif mode == SchemaMode.SIMILARITY:
-            narrow = similarity_prune(structured, question, nlp, threshold=similarity_threshold)
-        elif mode == SchemaMode.LLM_PRUNING:
-            narrow = llm_prune(structured, question, llm)
-        else:  # IE_EXTRACTION
-            narrow = ie_prune(structured, question, ie_engine, components=ALL_SCHEMA_COMPONENTS)
-        if strategy == CascadeStrategy.DELTA:
-            narrow = narrow_top2_relationships(narrow, question)
-        structured_levels.append((CascadeModeLevel.NARROW, narrow))
-
+    # Computed unconditionally (even if skip_narrow=True or strategy=DELTA skips the mode-specific
+    # ALL_SCHEMA_COMPONENTS narrow below) -- it's always the NODES_ONLY rung, and for
+    # strategy=DELTA it's also the base true_narrow_top2 is trimmed from (see below).
     if mode == SchemaMode.EXACT_MATCH:
         nodes_only = exact_match_prune(structured, question, components=DEFAULT_SCHEMA_COMPONENTS)
     elif mode == SchemaMode.NER_EXACT_MATCH:
@@ -897,6 +893,28 @@ def resolve_cascade_mode_levels(
         nodes_only = llm_prune_nodes_only(structured, question, llm)
     else:  # IE_EXTRACTION
         nodes_only = ie_prune(structured, question, ie_engine, components=DEFAULT_SCHEMA_COMPONENTS)
+
+    if not skip_narrow:
+        if strategy == CascadeStrategy.DELTA:
+            # true_narrow_top2 is built from the *node-label* selection (the schema induced by
+            # nodes_only -- same labels, every property, every inter-label relationship), not
+            # from the mode's ALL_SCHEMA_COMPONENTS narrow: that narrow can itself already be too
+            # wide (e.g. every relationship between two mentioned labels), so trimming on top of
+            # it doesn't reliably produce a cheap, tight first rung. Trimming nodes_only's
+            # relationships down to the top 2 per endpoint pair does.
+            narrow = narrow_top2_relationships(nodes_only, question)
+        elif mode == SchemaMode.EXACT_MATCH:
+            narrow = exact_match_prune(structured, question, components=ALL_SCHEMA_COMPONENTS)
+        elif mode == SchemaMode.NER_EXACT_MATCH:
+            narrow = ner_exact_match_prune(structured, question, nlp, components=ALL_SCHEMA_COMPONENTS)
+        elif mode == SchemaMode.SIMILARITY:
+            narrow = similarity_prune(structured, question, nlp, threshold=similarity_threshold)
+        elif mode == SchemaMode.LLM_PRUNING:
+            narrow = llm_prune(structured, question, llm)
+        else:  # IE_EXTRACTION
+            narrow = ie_prune(structured, question, ie_engine, components=ALL_SCHEMA_COMPONENTS)
+        structured_levels.append((CascadeModeLevel.NARROW, narrow))
+
     structured_levels.append((CascadeModeLevel.NODES_ONLY, nodes_only))
 
     structured_levels.append((CascadeModeLevel.FULL, structured))

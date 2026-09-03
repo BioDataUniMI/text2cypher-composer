@@ -22,7 +22,7 @@ from text2cypher_composer.schema_modes import (
     similarity_prune_nodes_only,
     two_hop_expansion_prune,
 )
-from text2cypher_composer.techniques import ALL_SCHEMA_COMPONENTS, DEFAULT_SCHEMA_COMPONENTS, CascadeModeLevel
+from text2cypher_composer.techniques import DEFAULT_SCHEMA_COMPONENTS, CascadeModeLevel
 
 STRUCTURED_SCHEMA = {
     "node_props": {
@@ -465,101 +465,119 @@ def test_two_hop_expansion_prune_keeps_only_reached_labels_and_relationships():
     assert kept_rel_types == {"REL_AB", "REL_BC"}  # REL_CD's endpoint NodeD is out of reach
 
 
-_CHAIN_NARROW = {
-    "node_props": {"NodeA": [{"property": "Label", "type": "STRING"}]},
-    "relationships": [],
-    "rel_props": {},
-    "metadata": {},
-}
-
-_CHAIN_NODES_ONLY = {
+_CASCADE_NODES_ONLY = {
     "node_props": {
         "NodeA": [{"property": "Label", "type": "STRING"}],
         "NodeB": [{"property": "Label", "type": "STRING"}],
         "NodeC": [{"property": "Label", "type": "STRING"}],
     },
     "relationships": [
-        {"start": "NodeA", "type": "REL_AB", "end": "NodeB"},
-        {"start": "NodeB", "type": "REL_BC", "end": "NodeC"},
+        # NodeA->NodeB has 3 patterns -- true_narrow_top2 must trim this pair down to 2
+        {"start": "NodeA", "type": "LIKES", "end": "NodeB"},
+        {"start": "NodeA", "type": "FOLLOWS", "end": "NodeB"},
+        {"start": "NodeA", "type": "BLOCKS", "end": "NodeB"},
+        # NodeB->NodeC has only 1 pattern -- untouched by the top-2 trim
+        {"start": "NodeB", "type": "PARTNERS_WITH", "end": "NodeC"},
     ],
-    "rel_props": {},
+    "rel_props": {"LIKES": [], "FOLLOWS": [], "BLOCKS": [], "PARTNERS_WITH": []},
     "metadata": {},
 }
 
+_CASCADE_FULL_SCHEMA = {
+    "node_props": {
+        **_CASCADE_NODES_ONLY["node_props"],
+        "NodeD": [{"property": "Label", "type": "STRING"}],
+        "NodeE": [{"property": "Label", "type": "STRING"}],  # disconnected
+    },
+    "relationships": _CASCADE_NODES_ONLY["relationships"] + [
+        {"start": "NodeC", "type": "MENTORS", "end": "NodeD"},
+    ],
+    "rel_props": {**_CASCADE_NODES_ONLY["rel_props"], "MENTORS": []},
+    "metadata": {},
+}
 
-def _fake_narrow_vs_nodes_only(_structured_schema, _question, components=DEFAULT_SCHEMA_COMPONENTS):
-    """Distinguishes `resolve_cascade_mode_levels`'s two `exact_match_prune` calls by the
-    `components` they're given -- `ALL_SCHEMA_COMPONENTS` for "narrow", `DEFAULT_SCHEMA_COMPONENTS`
-    for "nodes_only" -- so each rung's fixture is independently controllable, unlike a single
-    `return_value` mock (which can't tell the two calls apart)."""
-    return _CHAIN_NARROW if components == ALL_SCHEMA_COMPONENTS else _CHAIN_NODES_ONLY
+# Lexically favors LIKES/FOLLOWS ("likes"/"follows" tokens) over BLOCKS -- see
+# test_narrow_top2_relationships_keeps_only_the_top2_most_lexically_similar_per_pair above for the
+# same scoring mechanics.
+_CASCADE_QUESTION = "Which NodeA likes and follows NodeB?"
 
 
-def test_resolve_cascade_mode_levels_delta_first_rung_is_full_narrow_schema():
-    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_narrow_vs_nodes_only):
-        levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
-
-    # _CHAIN_NARROW has no relationships, so the top-2-per-pair trim is a no-op here
-    assert levels[0][1] == format_schema(_CHAIN_NARROW, is_enhanced=True)
+def _fake_nodes_only_selection(_structured_schema, _question, components=DEFAULT_SCHEMA_COMPONENTS):
+    """`resolve_cascade_mode_levels` now calls `exact_match_prune` only once under
+    `strategy="delta"` (for `"nodes_only"` -- `"true_narrow_top2"` is derived from it, not from a
+    separate `ALL_SCHEMA_COMPONENTS` call), so a single canned return covers it."""
+    return _CASCADE_NODES_ONLY
 
 
-def test_resolve_cascade_mode_levels_delta_second_rung_is_a_compact_inventory_plus_delta():
-    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_narrow_vs_nodes_only):
-        levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
+def test_resolve_cascade_mode_levels_delta_first_rung_is_built_from_nodes_only_not_the_mode_narrow():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=_CASCADE_FULL_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_nodes_only_selection):
+        levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", _CASCADE_QUESTION, strategy="delta")
+
+    narrow_text = levels[0][1]
+    # same node labels as nodes_only's own selection -- not a separately-computed, possibly
+    # differently-scoped mode narrow
+    assert "NodeA" in narrow_text and "NodeB" in narrow_text and "NodeC" in narrow_text
+    # top-2-per-pair trim: LIKES/FOLLOWS are lexically relevant to the question and survive ...
+    assert "LIKES" in narrow_text
+    assert "FOLLOWS" in narrow_text
+    # ... BLOCKS is the 3rd, least relevant NodeA->NodeB pattern -- dropped
+    assert "BLOCKS" not in narrow_text
+    # NodeB->NodeC's only pattern is untouched by the trim
+    assert "PARTNERS_WITH" in narrow_text
+
+
+def test_resolve_cascade_mode_levels_delta_second_rung_reveals_what_top2_held_back():
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=_CASCADE_FULL_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_nodes_only_selection):
+        levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", _CASCADE_QUESTION, strategy="delta")
 
     nodes_only_text = levels[1][1]
-    # a compact reminder that NodeA was already shown at the narrow rung ...
     assert "Schema already shown" in nodes_only_text
-    assert "NodeA" in nodes_only_text
-    # ... plus the elements nodes_only adds on top of it, shown in full
     assert "Additional schema" in nodes_only_text
-    assert "NodeB" in nodes_only_text
-    assert "NodeC" in nodes_only_text
-    assert "REL_AB" in nodes_only_text
-    assert "REL_BC" in nodes_only_text
-    # NodeD/NodeE are outside nodes_only's own selection entirely -- not this rung's job
-    assert "NodeD" not in nodes_only_text
-    assert "NodeE" not in nodes_only_text
+    delta_section = nodes_only_text.split("Additional schema")[1]
+    # nodes_only shares every node label/property with true_narrow_top2 (same underlying
+    # selection) -- its whole job as a fallback is revealing BLOCKS, the one relationship pattern
+    # the top-2 trim held back
+    assert "BLOCKS" in delta_section
+    assert "LIKES" not in delta_section
+    assert "FOLLOWS" not in delta_section
+    assert "PARTNERS_WITH" not in delta_section
 
 
 def test_resolve_cascade_mode_levels_delta_third_rung_shows_what_nodes_only_missed():
-    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_narrow_vs_nodes_only):
-        levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", "some question", strategy="delta")
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=_CASCADE_FULL_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_nodes_only_selection):
+        levels = resolve_cascade_mode_levels(MagicMock(), "exact_match", _CASCADE_QUESTION, strategy="delta")
 
     full_text = levels[2][1]
-    # NodeD (never reached) and NodeE (disconnected) are new at the full rung
+    # NodeD/NodeE and the relationship reaching NodeD are entirely outside nodes_only's selection
     assert "NodeD" in full_text
     assert "NodeE" in full_text
-    assert "REL_CD" in full_text
-    # everything narrow + nodes_only already showed (across *both* previous rungs, not just the
-    # immediately previous one) is reminded via the compact inventory, not repeated in full
+    assert "MENTORS" in full_text
+    # everything true_narrow_top2 + nodes_only already showed (across *both* previous rungs, not
+    # just the immediately previous one) is reminded via the compact inventory, not repeated
     assert "Schema already shown" in full_text
     delta_section = full_text.split("Additional schema")[1]
-    delta_node_props_section = delta_section.split("The relationships:")[0]
-    # NodeA/NodeB/NodeC's own entries aren't repeated -- REL_AB/REL_BC aren't either, though
-    # NodeC still shows up naturally as REL_CD's start endpoint, a genuinely new relationship
-    assert "NodeA" not in delta_node_props_section
-    assert "NodeB" not in delta_node_props_section
-    assert "NodeC" not in delta_node_props_section
-    assert "REL_AB" not in delta_section
-    assert "REL_BC" not in delta_section
+    assert "LIKES" not in delta_section
+    assert "FOLLOWS" not in delta_section
+    assert "BLOCKS" not in delta_section
+    assert "PARTNERS_WITH" not in delta_section
 
 
 def test_resolve_cascade_mode_levels_delta_skip_narrow_starts_at_nodes_only():
-    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=CHAIN_SCHEMA), \
-         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_narrow_vs_nodes_only):
+    with patch("text2cypher_composer.schema_modes.get_structured_schema", return_value=_CASCADE_FULL_SCHEMA), \
+         patch("text2cypher_composer.schema_modes.exact_match_prune", side_effect=_fake_nodes_only_selection):
         levels = resolve_cascade_mode_levels(
-            MagicMock(), "exact_match", "some question", strategy="delta", skip_narrow=True
+            MagicMock(), "exact_match", _CASCADE_QUESTION, strategy="delta", skip_narrow=True
         )
 
     assert [level for level, _ in levels] == [CascadeModeLevel.NODES_ONLY, CascadeModeLevel.FULL]
-    # narrow is never computed/emitted -- the first emitted rung is nodes_only, shown in full
-    # (nothing shown before it to delta against or hold back)
+    # narrow (true_narrow_top2) is never computed/emitted -- the first emitted rung is nodes_only,
+    # shown in full (nothing shown before it to delta against or hold back), BLOCKS included
     first_text = levels[0][1]
-    assert first_text == format_schema(_CHAIN_NODES_ONLY, is_enhanced=True)
+    assert first_text == format_schema(_CASCADE_NODES_ONLY, is_enhanced=True)
+    assert "BLOCKS" in first_text
     assert "NodeD" not in first_text
 
     second_text = levels[1][1]

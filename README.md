@@ -360,11 +360,15 @@ each rung is still a fresh, self-contained prompt with no conversation history, 
 would leave the model unable to reference a label/type it saw only at an earlier rung. Two changes
 on top of `"standard"`:
 
-1. **`"narrow"`** — additionally tightened to `"true_narrow_top2"`: when a node-label pair is
+1. **`"narrow"`** — replaced by **`"true_narrow_top2"`**: instead of the mode's own narrow
+   pruning (which can itself already be too wide — e.g. every relationship between two mentioned
+   labels), it's built from `"nodes_only"`'s own node-label selection — same labels, every
+   property, every inter-label relationship — with one extra trim: when a node-label pair is
    connected by more than 2 relationship types, only the 2 most lexically similar to the question
-   survive (`narrow_top2_relationships`) — purely token-overlap based, no `nlp`/`llm` needed.
-   Makes the cheapest, first rung genuinely narrow instead of keeping every relationship between
-   the selected labels.
+   survive (`narrow_top2_relationships`, purely token-overlap based, no `nlp`/`llm` needed). This
+   makes `"true_narrow_top2"` a strict, cheap-to-fall-back-from *subset* of `"nodes_only"` — same
+   labels/properties, fewer relationship choices — instead of a separately-selected schema that
+   might already be as wide.
 2. **`"nodes_only"`/`"full"`** — same selection as `"standard"`, but each one's prompt now carries
    a **compact inventory** of everything a previous rung already showed (label/type/property
    names only, via the terse non-enhanced `format_schema` style — no examples/statistics) plus

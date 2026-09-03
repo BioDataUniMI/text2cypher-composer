@@ -948,10 +948,12 @@ every rung is still a fresh, self-contained prompt with no conversation history,
 rung *only* the newly introduced elements would leave the model unable to reference a label/type
 it only saw at an earlier rung. Two changes on top of `"standard"`:
 
-1. **`"narrow"`** becomes `"true_narrow_top2"` — when a node-label pair is connected by more than
-   2 relationship types, only the 2 most lexically similar to the question survive
-   (`narrow_top2_relationships`, pure token overlap, no `nlp`/`llm` needed) — so the cheapest,
-   first rung is genuinely narrow.
+1. **`"narrow"`** becomes `"true_narrow_top2"` — built from `"nodes_only"`'s own node-label
+   selection (not the mode's own narrow pruning, which can itself already be too wide), with one
+   extra trim: when a node-label pair is connected by more than 2 relationship types, only the 2
+   most lexically similar to the question survive (`narrow_top2_relationships`, pure token
+   overlap, no `nlp`/`llm` needed). So `"true_narrow_top2"` is a strict, cheap-to-fall-back-from
+   subset of `"nodes_only"` — same labels/properties, fewer relationship choices.
 2. **`"nodes_only"`/`"full"`** keep the same selection as `"standard"`, but their prompt now shows
    a **compact inventory** of everything a previous rung already showed (label/type/property names
    only, no examples — the terse non-enhanced `format_schema` style) plus only what's *newly
@@ -1502,9 +1504,10 @@ md("""\
   `result.cascade_mode_level`/`result.cascade_mode_attempts`/`result.cascade_mode_prompts`/
   `result.cascade_mode_prompt_tokens` report which rung was used and what each tried rung cost.
 - `cascade_strategy="delta"` (§9.1, requires `cascade_mode=True`) is the "Incremental delta
-  cascade": `"narrow"` becomes `"true_narrow_top2"` (only the 2 most lexically relevant
-  relationship types per node-label pair survive), and every rung after the first shows a compact
-  inventory of everything a previous rung already showed (label/type/property names, no examples)
+  cascade": `"narrow"` becomes `"true_narrow_top2"` — built from `"nodes_only"`'s own node-label
+  selection rather than the mode's own (possibly already-wide) narrow pruning, keeping only the 2
+  most lexically relevant relationship types per node-label pair — and every rung after the first
+  shows a compact inventory of everything a previous rung already showed (label/type/property names, no examples)
   plus only the schema newly introduced at that rung — instead of repeating the full schema, or
   showing only the delta with no memory of what the model already saw. Every rung, including this
   one, stays a fresh, independent, self-contained prompt (no reference to a previous rung's query

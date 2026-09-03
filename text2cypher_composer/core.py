@@ -462,12 +462,15 @@ def run(
             node labels matched) → `"full"`, each rung a fresh,
             self-contained prompt carrying that rung's *entire* schema.
             `"delta"` — the "Incremental delta cascade" — changes two
-            things: (1) `"narrow"` is additionally tightened to only the
-            top-2 relationship patterns per node-label pair, ranked by
-            lexical similarity to the question (see `schema_modes.
-            narrow_top2_relationships` — "true_narrow_top2"); (2) every rung
-            still gets a fresh, independent, self-contained prompt (no
-            reference to a previous rung's query or failure — deliberately
+            things: (1) `"narrow"` is replaced by `"true_narrow_top2"` —
+            built from `"nodes_only"`'s own node-label selection (not the
+            mode's own narrow pruning, which can itself already be too
+            wide), keeping only the top-2 relationship patterns per
+            node-label pair, ranked by lexical similarity to the question
+            (see `schema_modes.narrow_top2_relationships`) — so it's a
+            strict, cheap-to-fall-back-from subset of `"nodes_only"`; (2)
+            every rung still gets a fresh, independent, self-contained
+            prompt (no reference to a previous rung's query or failure — deliberately
             *not* `rescue_prompt`-style), but a rung after the first shows a
             compact inventory of everything a previous rung already showed
             (label/type/property names only, no examples) plus only the
