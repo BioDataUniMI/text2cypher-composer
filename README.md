@@ -16,7 +16,7 @@
 
 Translate a natural-language question into an executable Cypher query and run it
 against a Neo4j database, using the prompting strategies from the
-[bio2C](bio2C/README.md) benchmark: `vanilla`, `Schema`, `RAG`, `RAG+O`,
+[https://github.com/BioDataUniMI/bio2C](bio2C/README.md) benchmark: `vanilla`, `Schema`, `RAG`, `RAG+O`,
 `Schema+RAG`, `Schema+RAG+O`.
 
 ## Install
@@ -810,6 +810,20 @@ Two paths to a model specialized on your own question/Cypher examples, ported fr
 (dataset preparation) and
 [`bio2C/finetuning_LLaMa3-8B/Finetuning_llama3-8b.ipynb`](bio2C/finetuning_LLaMa3-8B/Finetuning_llama3-8b.ipynb)
 (LoRA training) — both start from the same leveled gold dataset.
+
+#### Reproducibility of the train/test split
+
+The split-generation code is included in
+[`text2cypher_composer/finetune_dataset.py`](text2cypher_composer/finetune_dataset.py),
+in `split_finetune_dataset`. It samples the test set independently within each
+dataset level and uses the remaining rows for training. The split used in the
+experiments is therefore reproduced with:
+
+```python
+train_df, test_df = split_finetune_dataset(
+    df, test_frac=0.10, random_state=42
+)
+```
 
 **1. Prepare the dataset.** `load_finetune_levels` loads and concatenates bio2C-style leveled
 gold JSON files (`nodeLevel.json`, `1hop.json`, ...; each a list of `{"question", "cypher"}`

@@ -486,9 +486,10 @@ def run(
             `rescue_prompt`'s error-aware fix-up) with progressively more
             retrieved RAG examples — the RAG-side sibling of `cascade_mode`,
             but expanding retrieved context instead of un-pruning the
-            schema: first a single example ("minimal"), then the dataset's
-            configured `n_results` ("moderate"), then finally every example
-            in the collection ("full"). Stops early once one rung succeeds.
+            schema: first the dataset's configured `n_results` ("minimal"),
+            then `2 * n_results` ("moderate"), then `5 * n_results`
+            ("full") — each capped at the collection's actual size (see
+            `rag.resolve_adaptive_rag_levels`). Stops early once one rung succeeds.
             Mutually exclusive with `cascade_mode`, `rescue_prompt`, and a
             non-default `max_retries` — `run()` raises `ValueError` if
             `adaptive_rag=True` is combined with any of those; pick one
@@ -581,11 +582,14 @@ def run(
         `cascade_mode_prompt_tokens` list, one per rung tried, that
         rung's initial prompt/token count — all default to `None`/`0`/`[]`
         if `cascade_mode` wasn't used. Under `cascade_strategy="delta"`,
-        `"nodes_only"` is the 2-hop structural expansion rather than
-        `nodes_only` pruning, and `schema` holds only the *delta* text
-        actually shown at the winning rung (not the cumulative schema up to
-        it) — still a fresh, self-contained prompt with no reference to a
-        previous rung's query or failure. If `adaptive_rag` was used instead,
+        `"narrow"` is replaced by `"true_narrow_top2"` (see
+        `cascade_strategy`'s description above), and `schema` holds, for
+        every rung after the first, a compact inventory of what a previous
+        rung already showed plus only this rung's newly introduced elements
+        (not that rung's full structured schema, and not the winning rung's
+        delta alone with no memory of what came before) — still a fresh,
+        self-contained prompt with no reference to a previous rung's query
+        or failure. If `adaptive_rag` was used instead,
         `adaptive_rag_level`/`adaptive_rag_attempts`/`adaptive_rag_prompts`/
         `adaptive_rag_prompt_tokens` are the same shape, one rung per
         retrieved-example count tried ("minimal"/"moderate"/"full") instead
