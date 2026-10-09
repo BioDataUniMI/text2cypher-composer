@@ -15,8 +15,7 @@
 [![Coveralls Coverage](https://coveralls.io/repos/github/BioDataUniMI/text2cypher-composer/badge.svg?branch=main)](https://coveralls.io/github/BioDataUniMI/text2cypher-composer?branch=main)
 
 Translate a natural-language question into an executable Cypher query and run it
-against a Neo4j database, using the prompting strategies from the
-[https://github.com/BioDataUniMI/bio2C](bio2C/README.md) benchmark: `vanilla`, `Schema`, `RAG`, `RAG+O`,
+against a Neo4j database, using the prompting strategies from the [*bio2C*](https://github.com/BioDataUniMI/bio2C) benchmark: `vanilla`, `Schema`, `RAG`, `RAG+O`,
 `Schema+RAG`, `Schema+RAG+O`.
 
 ## Install
@@ -704,7 +703,7 @@ A plain path string is also accepted for `dataset` and is resolved via
 
 `build_rag_example_files` materializes the `NLquestions/`, `CypherQueries/`, and
 `Neo4jOutputs/` directories a `RAGDataset` expects, from your own examples —
-useful when you don't already have a bio2C-style benchmark on disk:
+useful when you don't already have a *bio2C*-style benchmark on disk:
 
 ```python
 import pandas as pd
@@ -825,9 +824,9 @@ train_df, test_df = split_finetune_dataset(
 )
 ```
 
-**1. Prepare the dataset.** `load_finetune_levels` loads and concatenates bio2C-style leveled
+**1. Prepare the dataset.** `load_finetune_levels` loads and concatenates *bio2C*-style leveled
 gold JSON files (`nodeLevel.json`, `1hop.json`, ...; each a list of `{"question", "cypher"}`
-records), tagging every row with its source `level` and a bio2C-style `ID`:
+records), tagging every row with its source `level` and a *bio2C*-style `ID`:
 
 ```python
 from text2cypher_composer import load_finetune_levels, max_cypher_tokens, split_finetune_dataset
@@ -1022,7 +1021,7 @@ argument `run()` takes — same names, same defaults:
   `rescue_prompt`, same as `run()` enforces.
 
 Besides the metric/pass@j columns, `report.to_dataframe()` also carries, per question: any
-columns `gold_df` had beyond `question`/`cypher` (e.g. bio2C's `"ID"`/`"level"`, if you built
+columns `gold_df` had beyond `question`/`cypher` (e.g. *bio2C*'s `"ID"`/`"level"`, if you built
 `gold_df` with `load_finetune_levels`), `prompt`/`prompt_tokens` (the exact messages sent for the
 first attempt and their `tiktoken` token count — `None` if `tiktoken` isn't installed; compare it
 across `technique`/`schema_mode` rows to see how many tokens schema filtering saves),
